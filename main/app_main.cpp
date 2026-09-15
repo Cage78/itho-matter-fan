@@ -598,6 +598,19 @@ static bool i2c_query_status(itho_hru_status *out)
         return false;
     }
 
+    // One-time full-field dump per boot: the "before" baseline for decoding
+    // fields 0 (error) and 1 (status) once the unit signals filter maintenance
+    static bool baseline_dumped = false;
+    if (!baseline_dumped)
+    {
+        baseline_dumped = true;
+        char buf[512];
+        size_t off = 0;
+        for (size_t f = 0; f < status_field_count && off < sizeof(buf) - 16; f++)
+            off += snprintf(buf + off, sizeof(buf) - off, "%zu:%ld ", f, (long)values[f]);
+        ESP_LOGI(TAG, "I2C 2401 baseline (all fields): %s", buf);
+    }
+
     out->error = values[STATUS_IDX_ERROR];
     out->status = values[STATUS_IDX_STATUS];
     // Fanspeed fields on the HRU300 use divider 256: the raw byte is the
@@ -614,6 +627,23 @@ static bool i2c_query_status(itho_hru_status *out)
         out->temp_centi[i] = (div == 0) ? values[temp_fields[i]] * 100
                                         : values[temp_fields[i]] * 100 / (int32_t)div;
     }
+    return true;
+}
+
+// --- I2C 0x31D9 quick status probe (fault/frost/filter-dirty bits) ---
+// From ithowifi sendQuery31D9. The 31xx family is CVE-era and the HRU300 never
+// answered 31DA, so support is unknown — this is a one-shot probe at startup.
+// (Command bytes verbatim from ithowifi, including the 0xEF checksum byte.)
+static const uint8_t I2C_CMD_31D9[] = {0x82, 0x80, 0x31, 0xD9, 0x04, 0x00, 0xEF};
+
+static bool i2c_query_31d9(uint8_t *status_byte, float *speed_status)
+{
+    uint8_t rxbuf[I2C_BUF_SIZE] = {};
+    size_t len = i2c_query(I2C_CMD_31D9, sizeof(I2C_CMD_31D9), 0x31D9, rxbuf, sizeof(rxbuf));
+    if (len < 8)
+        return false;
+    *status_byte = rxbuf[6];   // bitfield: 0x80 fault, 0x40 frost, 0x20 filter dirty
+    *speed_status = rxbuf[7] / 2.0f;
     return true;
 }
 
@@ -807,7 +837,8 @@ static void i2c_poll_task(void *arg)
     while (true)
     {
         itho_hru_status st;
-        if (i2c_query_status(&st))
+        bool status_ok = i2c_query_status(&st);
+        if (status_ok)
         {
             ESP_LOGI(TAG, "I2C 2401: error=%ld status=%ld rel=%ld%% abs=%ld%%",
                      (long)st.error, (long)st.status, (long)st.rel_speed_pct, (long)st.abs_speed_pct);
@@ -829,6 +860,26 @@ static void i2c_poll_task(void *arg)
 
         // Summer Night Boost switch (runs its own 2410 queries/writes)
         snb_poll();
+
+        // One-shot 31D9 probe: three attempts after the first successful 2401
+        // poll, then a clear verdict (the HRU300 may not support 31xx queries)
+        static uint8_t probe_31d9 = 3;
+        if (probe_31d9 > 0 && status_ok)
+        {
+            probe_31d9--;
+            uint8_t sb = 0;
+            float spd = 0;
+            if (i2c_query_31d9(&sb, &spd))
+            {
+                ESP_LOGI(TAG, "I2C 31D9 supported: status=0x%02X → fault=%d frost=%d filter_dirty=%d, speed_status=%.1f",
+                         sb, !!(sb & 0x80), !!(sb & 0x40), !!(sb & 0x20), spd);
+                probe_31d9 = 0;
+            }
+            else if (probe_31d9 == 0)
+            {
+                ESP_LOGW(TAG, "I2C 31D9: no response after 3 attempts — not supported on this unit");
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(I2C_POLL_INTERVAL_MS));
     }
