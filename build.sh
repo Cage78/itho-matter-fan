@@ -15,7 +15,14 @@ export PATH="$CHIP_ROOT/.environment/cipd/packages/pigweed:$PATH"
 
 # ESP-IDF tools (this sets up the correct Python venv and toolchain)
 export IDF_TOOLS_PATH="$HOME/.espressif"
-. $IDF_PATH/export.sh > /dev/null 2>&1
+# export.sh aborts entirely when optional tools (riscv gdb, esp32s2/s3
+# toolchains) are missing, skipping the PATH setup. Do it ourselves instead:
+# eval whatever idf_tools.py exports, ignoring its exit status — the esp32
+# toolchain entries are complete.
+set +e
+idf_exports=$("$IDF_PATH"/tools/idf_tools.py export 2>/dev/null)
+set -e
+eval "${idf_exports}"
 
 # Set esp-matter path for CMake
 export ESP_MATTER_PATH

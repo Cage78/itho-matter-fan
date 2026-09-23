@@ -608,7 +608,7 @@ static bool i2c_query_status(itho_hru_status *out)
         size_t off = 0;
         for (size_t f = 0; f < status_field_count && off < sizeof(buf) - 16; f++)
             off += snprintf(buf + off, sizeof(buf) - off, "%zu:%ld ", f, (long)values[f]);
-        ESP_LOGI(TAG, "I2C 2401 baseline (all fields): %s", buf);
+        ESP_LOGI(TAG, "HIER I2C 2401 baseline (all fields): %s", buf);
     }
 
     out->error = values[STATUS_IDX_ERROR];
@@ -871,13 +871,13 @@ static void i2c_poll_task(void *arg)
             float spd = 0;
             if (i2c_query_31d9(&sb, &spd))
             {
-                ESP_LOGI(TAG, "I2C 31D9 supported: status=0x%02X → fault=%d frost=%d filter_dirty=%d, speed_status=%.1f",
+                ESP_LOGI(TAG, "HIER I2C 31D9 supported: status=0x%02X → fault=%d frost=%d filter_dirty=%d, speed_status=%.1f",
                          sb, !!(sb & 0x80), !!(sb & 0x40), !!(sb & 0x20), spd);
                 probe_31d9 = 0;
             }
             else if (probe_31d9 == 0)
             {
-                ESP_LOGW(TAG, "I2C 31D9: no response after 3 attempts — not supported on this unit");
+                ESP_LOGW(TAG, "HIER I2C 31D9: no response after 3 attempts — not supported on this unit");
             }
         }
 
