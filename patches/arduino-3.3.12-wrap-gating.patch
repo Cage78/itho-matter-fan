@@ -1,0 +1,28 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4629d30..35fad1a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -519,14 +519,21 @@ endif()
+ 
+ # Matter: skip CHIP InitWiFiStack when Thread or Ethernet is selected.
+ # --wrap of a missing symbol is ignored (H2 has no Wi-Fi stack).
+-if(CONFIG_ESP_MATTER_ENABLE_DATA_MODEL AND CONFIG_ENABLE_WIFI_STATION)
++# NOTE (itho_fan): the __wrap_InitWiFiStack implementation is only provided when
++# Arduino's own Matter library is built; with esp-matter from source the wrap
++# leaves esp_matter::start() with an undefined reference. Gate it accordingly.
++if(CONFIG_ESP_MATTER_ENABLE_DATA_MODEL AND CONFIG_ENABLE_WIFI_STATION AND CONFIG_ARDUINO_SELECTIVE_Matter)
+   idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=_ZN4chip11DeviceLayer8Internal10ESP32Utils13InitWiFiStackEv" APPEND)
+   target_link_libraries(${COMPONENT_LIB} INTERFACE "-u __wrap__ZN4chip11DeviceLayer8Internal10ESP32Utils13InitWiFiStackEv")
+ endif()
+ 
+ # Matter data model: prefer SPIRAM when that heap exists (bypass malloc 4096 rule).
+ # C++ mangled names from harvested libespressif__esp_matter.a (nm-confirmed).
+-if(CONFIG_ESP_MATTER_ENABLE_DATA_MODEL)
++# NOTE (itho_fan): the __wrap_esp_matter_mem_* implementations only exist in the
++# managed espressif__esp_matter registry component, which this project does not use
++# (esp-matter is built from source). Only enable the wraps when Arduino's own
++# Matter library is selected, otherwise the link fails with undefined references.
++if(CONFIG_ESP_MATTER_ENABLE_DATA_MODEL AND CONFIG_ARDUINO_SELECTIVE_Matter)
+   idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=_Z21esp_matter_mem_callocjj" APPEND)
+   idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=_Z22esp_matter_mem_reallocPvj" APPEND)
+   idf_build_set_property(LINK_OPTIONS "-Wl,--wrap=_Z19esp_matter_mem_freePv" APPEND)

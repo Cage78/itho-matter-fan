@@ -80,6 +80,11 @@ static constexpr uint32_t ON_OFF_ATTR_ID = 0x0000;
 static constexpr uint32_t BOOLEAN_STATE_CLUSTER_ID = 0x0045;
 static constexpr uint32_t BOOLEAN_STATE_VALUE_ATTR_ID = 0x0000;
 
+// HEPA Filter Monitoring cluster (on the air purifier endpoint)
+static constexpr uint32_t HEPA_FILTER_MONITORING_CLUSTER_ID = 0x0071;
+static constexpr uint32_t HEPA_CONDITION_ATTR_ID = 0x0000;
+static constexpr uint32_t HEPA_CHANGE_INDICATION_ATTR_ID = 0x0002;
+
 static uint16_t temp_endpoint_ids[4] = {}; // outside, supply (inlet), extract, exhaust
 static uint16_t snb_endpoint_id = 0;       // Summer Night Boost switch
 static uint16_t filter_endpoint_id = 0;    // HRU Filter contact sensor
@@ -871,12 +876,27 @@ static void i2c_poll_task(void *arg)
             // inverted (verified on a live W01).
             bool filter_dirty = (st.error == 1);
             static int last_filter_dirty = -1;
-            if (filter_endpoint_id != 0 && (int)filter_dirty != last_filter_dirty)
+            if ((int)filter_dirty != last_filter_dirty)
             {
                 last_filter_dirty = (int)filter_dirty;
-                esp_matter_attr_val_t fv = esp_matter_bool(!filter_dirty);
-                esp_matter::attribute::update(filter_endpoint_id, BOOLEAN_STATE_CLUSTER_ID,
-                                              BOOLEAN_STATE_VALUE_ATTR_ID, &fv);
+                // Bridged contact sensor (fallback; open = filters need cleaning)
+                if (filter_endpoint_id != 0)
+                {
+                    esp_matter_attr_val_t fv = esp_matter_bool(!filter_dirty);
+                    esp_matter::attribute::update(filter_endpoint_id, BOOLEAN_STATE_CLUSTER_ID,
+                                                  BOOLEAN_STATE_VALUE_ATTR_ID, &fv);
+                }
+                // HEPA Filter Monitoring on the air purifier endpoint:
+                // Condition 100 = OK / 0 = dirty; ChangeIndication 2 = Critical
+                if (fan_endpoint_id != 0)
+                {
+                    esp_matter_attr_val_t cond = esp_matter_uint8(filter_dirty ? 0 : 100);
+                    esp_matter::attribute::update(fan_endpoint_id, HEPA_FILTER_MONITORING_CLUSTER_ID,
+                                                  HEPA_CONDITION_ATTR_ID, &cond);
+                    esp_matter_attr_val_t ind = esp_matter_uint8(filter_dirty ? 2 : 0);
+                    esp_matter::attribute::update(fan_endpoint_id, HEPA_FILTER_MONITORING_CLUSTER_ID,
+                                                  HEPA_CHANGE_INDICATION_ATTR_ID, &ind);
+                }
                 if (filter_dirty)
                     ESP_LOGW(TAG, "HIER filter dirty: W01 active (error=%ld) — clean the filters", (long)st.error);
                 else
@@ -1123,25 +1143,27 @@ extern "C" void app_main()
     node::config_t node_config;
     node_t *node = node::create(&node_config, app_attribute_update_cb, app_identification_cb);
 
-    // Create fan endpoint
-    endpoint_t *endpoint = endpoint::create(node, ENDPOINT_FLAG_NONE, NULL);
-    add_device_type(endpoint, ESP_MATTER_FAN_DEVICE_TYPE_ID, ESP_MATTER_FAN_DEVICE_TYPE_VERSION);
+    // Create the fan endpoint as an Air Purifier device type (esp-matter v1.5):
+    // air_purifier::create() adds Identify + FanControl with the same attribute
+    // set we built by hand under v1.0. Apple Home then shows native filter status.
+    air_purifier::config_t ap_config;
+    ap_config.fan_control.fan_mode = 0;
+    ap_config.fan_control.fan_mode_sequence = FAN_MODE_SEQUENCE;
+    ap_config.fan_control.percent_setting = nullable<uint8_t>(0);
+    ap_config.fan_control.percent_current = 0;
+    endpoint_t *endpoint = air_purifier::create(node, &ap_config, ENDPOINT_FLAG_NONE, NULL);
 
-    // Create required clusters
-    cluster::identify::config_t identify_config;
+    // Groups cluster (parity with the v1.0 manual fan endpoint)
     cluster::groups::config_t groups_config;
-    descriptor::create(endpoint, CLUSTER_FLAG_SERVER);
-    identify::create(endpoint, &identify_config, CLUSTER_FLAG_SERVER);
     groups::create(endpoint, &groups_config, CLUSTER_FLAG_SERVER);
 
-    // Create FanControl cluster manually (v1.0's fan_control::create() is not implemented)
-    cluster_t *cluster = cluster::create(endpoint, FAN_CONTROL_CLUSTER_ID, CLUSTER_FLAG_SERVER);
-    cluster::global::attribute::create_feature_map(cluster, 0);
-    cluster::global::attribute::create_cluster_revision(cluster, 2);
-    fan_control::attribute::create_fan_mode(cluster, 0);
-    fan_control::attribute::create_fan_mode_sequence(cluster, FAN_MODE_SEQUENCE);
-    fan_control::attribute::create_percent_setting(cluster, nullable<uint8_t>(0));
-    fan_control::attribute::create_percent_current(cluster, 0);
+    // HEPA Filter Monitoring cluster on the same endpoint. The HRU300 has no
+    // filter lifetime percentage, so Condition is mapped 100 (OK) / 0 (dirty)
+    // and ChangeIndication OK/Critical from the 2401 error number in the poll
+    // task. (hepa_filter_monitoring::create already adds ChangeIndication.)
+    hepa_filter_monitoring::config_t hepa_config;
+    cluster_t *hepa = hepa_filter_monitoring::create(endpoint, &hepa_config, CLUSTER_FLAG_SERVER);
+    hepa_filter_monitoring::attribute::create_condition(hepa, 100);
 
     fan_endpoint_id = endpoint::get_id(endpoint);
     ESP_LOGI(TAG, "Itho Fan Matter endpoint_id: %d", fan_endpoint_id);
@@ -1149,7 +1171,8 @@ extern "C" void app_main()
     // Aggregator: the sensors and the switch are created as bridged endpoints
     // behind it, each with a Bridged Device Basic Information cluster whose
     // NodeLabel Apple Home displays as the accessory name.
-    endpoint_t *agg = aggregator::create(node, ENDPOINT_FLAG_NONE, NULL);
+    aggregator::config_t agg_config;
+    endpoint_t *agg = aggregator::create(node, &agg_config, ENDPOINT_FLAG_NONE, NULL);
 
     // Temperature sensors from I2C 2401 fields 2/5/6/7 (labels per ithowifi
     // hru250_300.h): outside, supply (inlet), extract, exhaust
@@ -1163,9 +1186,9 @@ extern "C" void app_main()
         endpoint_t *t_ep = temperature_sensor::create(node, &ts_config, ENDPOINT_FLAG_BRIDGE, NULL);
         if (t_ep == nullptr)
             continue;
-        bridged_device_basic::config_t bdb_config;
-        cluster_t *bdb = bridged_device_basic::create(t_ep, &bdb_config, CLUSTER_FLAG_SERVER);
-        basic_information::attribute::create_node_label(bdb, temp_names[i], strlen(temp_names[i]));
+        bridged_device_basic_information::config_t bdb_config;
+        cluster_t *bdb = bridged_device_basic_information::create(t_ep, &bdb_config, CLUSTER_FLAG_SERVER);
+        bridged_device_basic_information::attribute::create_node_label(bdb, temp_names[i], strlen(temp_names[i]));
         endpoint::set_parent_endpoint(t_ep, agg);
         temp_endpoint_ids[i] = endpoint::get_id(t_ep);
     }
@@ -1174,13 +1197,13 @@ extern "C" void app_main()
 
     // Summer Night Boost switch (I2C 2410 setting)
     static char snb_name[] = "Summer Night Boost";
-    on_off_plugin_unit::config_t snb_config;
-    endpoint_t *s_ep = on_off_plugin_unit::create(node, &snb_config, ENDPOINT_FLAG_BRIDGE, NULL);
+    on_off_plug_in_unit::config_t snb_config;
+    endpoint_t *s_ep = on_off_plug_in_unit::create(node, &snb_config, ENDPOINT_FLAG_BRIDGE, NULL);
     if (s_ep != nullptr)
     {
-        bridged_device_basic::config_t bdb_config;
-        cluster_t *bdb = bridged_device_basic::create(s_ep, &bdb_config, CLUSTER_FLAG_SERVER);
-        basic_information::attribute::create_node_label(bdb, snb_name, strlen(snb_name));
+        bridged_device_basic_information::config_t bdb_config;
+        cluster_t *bdb = bridged_device_basic_information::create(s_ep, &bdb_config, CLUSTER_FLAG_SERVER);
+        bridged_device_basic_information::attribute::create_node_label(bdb, snb_name, strlen(snb_name));
         endpoint::set_parent_endpoint(s_ep, agg);
         snb_endpoint_id = endpoint::get_id(s_ep);
     }
@@ -1195,9 +1218,9 @@ extern "C" void app_main()
     endpoint_t *f_ep = contact_sensor::create(node, &cs_config, ENDPOINT_FLAG_BRIDGE, NULL);
     if (f_ep != nullptr)
     {
-        bridged_device_basic::config_t bdb_config;
-        cluster_t *bdb = bridged_device_basic::create(f_ep, &bdb_config, CLUSTER_FLAG_SERVER);
-        basic_information::attribute::create_node_label(bdb, filter_name, strlen(filter_name));
+        bridged_device_basic_information::config_t bdb_config;
+        cluster_t *bdb = bridged_device_basic_information::create(f_ep, &bdb_config, CLUSTER_FLAG_SERVER);
+        bridged_device_basic_information::attribute::create_node_label(bdb, filter_name, strlen(filter_name));
         endpoint::set_parent_endpoint(f_ep, agg);
         filter_endpoint_id = endpoint::get_id(f_ep);
     }
