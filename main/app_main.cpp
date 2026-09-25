@@ -76,8 +76,13 @@ static constexpr uint32_t TEMP_MEAS_VALUE_ATTR_ID = 0x0000;
 static constexpr uint32_t ON_OFF_CLUSTER_ID = 0x0006;
 static constexpr uint32_t ON_OFF_ATTR_ID = 0x0000;
 
+// Boolean State cluster (HRU Filter contact sensor)
+static constexpr uint32_t BOOLEAN_STATE_CLUSTER_ID = 0x0045;
+static constexpr uint32_t BOOLEAN_STATE_VALUE_ATTR_ID = 0x0000;
+
 static uint16_t temp_endpoint_ids[4] = {}; // outside, supply (inlet), extract, exhaust
 static uint16_t snb_endpoint_id = 0;       // Summer Night Boost switch
+static uint16_t filter_endpoint_id = 0;    // HRU Filter contact sensor
 
 // Dragging a speed slider produces a burst of PercentSetting writes, so the
 // resulting RF command is only transmitted once the writes stop arriving.
@@ -856,6 +861,25 @@ static void i2c_poll_task(void *arg)
                 esp_matter::attribute::update(temp_endpoint_ids[i], TEMP_MEAS_CLUSTER_ID,
                                               TEMP_MEAS_VALUE_ATTR_ID, &tv);
             }
+
+            // Filter status contact sensor: the HRU300 signals W01 (clean
+            // filters, blinking status LED) as error number 1 in the 2401
+            // status — it does not answer the CVE-era 0x31D9 query. Mapping
+            // calibrated against a live W01 (error 0 → 1, status 8).
+            // Contact sensor convention: open (true) = filters need cleaning.
+            bool filter_dirty = (st.error == 1);
+            static int last_filter_dirty = -1;
+            if (filter_endpoint_id != 0 && (int)filter_dirty != last_filter_dirty)
+            {
+                last_filter_dirty = (int)filter_dirty;
+                esp_matter_attr_val_t fv = esp_matter_bool(filter_dirty);
+                esp_matter::attribute::update(filter_endpoint_id, BOOLEAN_STATE_CLUSTER_ID,
+                                              BOOLEAN_STATE_VALUE_ATTR_ID, &fv);
+                if (filter_dirty)
+                    ESP_LOGW(TAG, "HIER filter dirty: W01 active (error=%ld) — clean the filters", (long)st.error);
+                else
+                    ESP_LOGI(TAG, "HIER filter status OK (error=%ld)", (long)st.error);
+            }
         }
 
         // Summer Night Boost switch (runs its own 2410 queries/writes)
@@ -1159,6 +1183,22 @@ extern "C" void app_main()
         snb_endpoint_id = endpoint::get_id(s_ep);
     }
     ESP_LOGI(TAG, "Summer Night Boost endpoint_id: %d", snb_endpoint_id);
+
+    // HRU Filter status as a contact sensor (Boolean State cluster):
+    // open = filters need cleaning. State is driven from the 2401 error
+    // number in the poll task. Apple Home automations can notify on it.
+    static char filter_name[] = "HRU Filter";
+    contact_sensor::config_t cs_config;
+    endpoint_t *f_ep = contact_sensor::create(node, &cs_config, ENDPOINT_FLAG_BRIDGE, NULL);
+    if (f_ep != nullptr)
+    {
+        bridged_device_basic::config_t bdb_config;
+        cluster_t *bdb = bridged_device_basic::create(f_ep, &bdb_config, CLUSTER_FLAG_SERVER);
+        basic_information::attribute::create_node_label(bdb, filter_name, strlen(filter_name));
+        endpoint::set_parent_endpoint(f_ep, agg);
+        filter_endpoint_id = endpoint::get_id(f_ep);
+    }
+    ESP_LOGI(TAG, "HRU Filter endpoint_id: %d", filter_endpoint_id);
 
     // Start Matter
     esp_matter::start(NULL);
