@@ -866,13 +866,15 @@ static void i2c_poll_task(void *arg)
             // filters, blinking status LED) as error number 1 in the 2401
             // status — it does not answer the CVE-era 0x31D9 query. Mapping
             // calibrated against a live W01 (error 0 → 1, status 8).
-            // Contact sensor convention: open (true) = filters need cleaning.
+            // Contact sensor convention: open = filters need cleaning. Apple
+            // Home shows Boolean State true as "Closed", so the value is
+            // inverted (verified on a live W01).
             bool filter_dirty = (st.error == 1);
             static int last_filter_dirty = -1;
             if (filter_endpoint_id != 0 && (int)filter_dirty != last_filter_dirty)
             {
                 last_filter_dirty = (int)filter_dirty;
-                esp_matter_attr_val_t fv = esp_matter_bool(filter_dirty);
+                esp_matter_attr_val_t fv = esp_matter_bool(!filter_dirty);
                 esp_matter::attribute::update(filter_endpoint_id, BOOLEAN_STATE_CLUSTER_ID,
                                               BOOLEAN_STATE_VALUE_ATTR_ID, &fv);
                 if (filter_dirty)
@@ -1185,8 +1187,9 @@ extern "C" void app_main()
     ESP_LOGI(TAG, "Summer Night Boost endpoint_id: %d", snb_endpoint_id);
 
     // HRU Filter status as a contact sensor (Boolean State cluster):
-    // open = filters need cleaning. State is driven from the 2401 error
-    // number in the poll task. Apple Home automations can notify on it.
+    // open = filters need cleaning (Boolean State is inverted: Apple Home
+    // shows true as "Closed"). State is driven from the 2401 error number
+    // in the poll task. Apple Home automations can notify on it.
     static char filter_name[] = "HRU Filter";
     contact_sensor::config_t cs_config;
     endpoint_t *f_ep = contact_sensor::create(node, &cs_config, ENDPOINT_FLAG_BRIDGE, NULL);
