@@ -34,6 +34,7 @@
 #include <app/server/Server.h>
 #include <app-common/zap-generated/ids/Attributes.h>
 #include <app-common/zap-generated/ids/Clusters.h>
+#include <platform/ESP32/ESP32Config.h>
 
 static const char *TAG = "itho_fan";
 static uint16_t fan_endpoint_id = 0;
@@ -1107,6 +1108,30 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
     return ESP_OK;
 }
 
+// One-time factory identity. chip's Basic Information cluster serves
+// VendorName/ProductName through the ESP32FactoryDataProvider, which reads the
+// "fctry" NVS namespace and otherwise falls back to the TEST_VENDOR/TEST_PRODUCT
+// compile-time defaults. Write our names once; requires the chip stack to be
+// initialized (the factory partition's NVS is set up during esp_matter::start),
+// so call this after it, before commissioning.
+static void ensure_factory_identity()
+{
+    using chip::DeviceLayer::Internal::ESP32Config;
+    char buf[48];
+    size_t len = 0;
+    if (ESP32Config::ReadConfigValueStr(ESP32Config::kConfigKey_VendorName, buf, sizeof(buf), len) != CHIP_NO_ERROR)
+    {
+        ESP32Config::WriteConfigValueStr(ESP32Config::kConfigKey_VendorName, "Cage78");
+        ESP_LOGI(TAG, "HIER factory VendorName set to Cage78");
+    }
+    len = 0;
+    if (ESP32Config::ReadConfigValueStr(ESP32Config::kConfigKey_ProductName, buf, sizeof(buf), len) != CHIP_NO_ERROR)
+    {
+        ESP32Config::WriteConfigValueStr(ESP32Config::kConfigKey_ProductName, "HRU 300 WTW");
+        ESP_LOGI(TAG, "HIER factory ProductName set to HRU 300 WTW");
+    }
+}
+
 extern "C" void app_main()
 {
     // Initialize NVS
@@ -1228,6 +1253,9 @@ extern "C" void app_main()
 
     // Start Matter
     esp_matter::start(NULL);
+
+    // Set VendorName/ProductName in the fctry namespace (one-time)
+    ensure_factory_identity();
 
 #if CONFIG_ENABLE_CHIP_SHELL
     esp_matter::console::diagnostics_register_commands();
