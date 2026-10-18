@@ -11,9 +11,10 @@
  *           field drives the mode). RF 31DA broadcasts from the HRU300 are
  *           received as a secondary feedback source.
  *
- * The HRU300 cannot be turned off; speeds are low/medium/high:
+ * The HRU300 cannot be turned off and has no auto mode (that needs CO2
+ * sensors); speeds are low/medium/high:
  *   PercentSetting detents: 33 = low, 66 = medium, 100 = high (0% → low)
- *   FanMode: 0 Off → low, 1 Low, 2 Medium, 3 High, 5 Auto
+ *   FanMode: 0 Off → low, 1 Low, 2 Medium, 3 High (Auto writes are rejected)
  * Mode from status (absolute fanspeed %): <1 off, <32 low, <60 medium, else high
  */
 
@@ -74,7 +75,9 @@ static constexpr uint32_t FAN_CONTROL_CLUSTER_ID = 0x0202;
 static constexpr uint32_t FAN_MODE_ATTR_ID = 0x0000;
 static constexpr uint32_t PERCENT_SETTING_ATTR_ID = 0x0002;
 static constexpr uint32_t PERCENT_CURRENT_ATTR_ID = 0x0003;
-static constexpr uint8_t FAN_MODE_SEQUENCE = 2; // 2 = Off/Low/Medium/High
+// 0 = Off/Low/Medium/High. Every sequence includes Off (Apple Home uses it
+// as the power button), so Off can't be hidden; it is mapped to low instead.
+static constexpr uint8_t FAN_MODE_SEQUENCE = 0;
 
 // TemperatureMeasurement cluster (I2C 2401 temperature fields)
 static constexpr uint32_t TEMP_MEAS_CLUSTER_ID = 0x0402;
@@ -133,11 +136,9 @@ static IthoCommand fan_mode_to_itho(uint8_t fan_mode)
     case 1: return IthoLow;    // Low
     case 2: return IthoMedium; // Medium
     case 3: return IthoHigh;   // High
-    case 5: return IthoAuto;   // Auto
-    default:
-        if (fan_mode == 4) return IthoHigh;  // On → High
-        if (fan_mode == 6) return IthoAuto;  // Smart → Auto
-        return IthoUnknown;
+    case 4: return IthoHigh;   // On → High
+    case 6: return IthoHigh;   // Smart → High (spec, when Auto is unsupported)
+    default: return IthoUnknown; // includes Auto: the HRU300 has none
     }
 }
 
@@ -191,8 +192,7 @@ static uint8_t fan_mode_to_percent(uint8_t fan_mode)
     case 2: return 66;  // Medium
     case 3: return 100; // High
     case 4: return 100; // On → High
-    case 5: return 50;  // Auto
-    case 6: return 50;  // Smart → Auto
+    case 6: return 100; // Smart → High
     default: return 0;
     }
 }
@@ -205,11 +205,10 @@ static uint8_t fan_mode_to_percent(uint8_t fan_mode)
 // by another task's feedback block (and be dropped as "feedback").
 static bool feedback_update_in_progress = false;
 
-// Speed last commanded through Matter, as a FanMode (1-3, or FAN_MODE_AUTO),
-// or FAN_MODE_NONE once the unit's reports are authoritative again. Guarded
-// by the CHIP stack lock (Matter callbacks already run under it).
+// Speed last commanded through Matter, as a FanMode (1-3), or FAN_MODE_NONE
+// once the unit's reports are authoritative again. Guarded by the CHIP stack
+// lock (Matter callbacks already run under it).
 static constexpr uint8_t FAN_MODE_NONE = 0xFF;
-static constexpr uint8_t FAN_MODE_AUTO = 5;
 static uint8_t commanded_mode = FAN_MODE_NONE;
 static uint32_t commanded_ms = 0;
 // The unit takes several poll cycles to ramp to a new speed, and a status
@@ -224,8 +223,8 @@ static void note_commanded_mode(uint8_t mode)
     commanded_ms = millis();
 }
 
-// Whether a manual speed reported by the unit may overwrite the attributes.
-// Caller holds the CHIP stack lock and has handled FAN_MODE_AUTO itself.
+// Whether a speed reported by the unit may overwrite the attributes.
+// Caller holds the CHIP stack lock.
 static bool accept_reported_mode(uint8_t reported)
 {
     if (commanded_mode == FAN_MODE_NONE)
@@ -239,8 +238,12 @@ static bool accept_reported_mode(uint8_t reported)
 }
 
 // Command awaiting transmission by rf_send_task. -1 means nothing pending.
-static std::atomic<int32_t> pending_rf_cmd{-1};
-static std::atomic<uint32_t> pending_rf_cmd_ms{0};
+// Command and timestamp change together under rf_cmd_mux: with separate
+// atomics, a repeat of the same command landing just before the claim would
+// be claimed without its debounce (seen as duplicate sends in the log).
+static portMUX_TYPE rf_cmd_mux = portMUX_INITIALIZER_UNLOCKED;
+static int32_t pending_rf_cmd = -1;
+static uint32_t pending_rf_cmd_ms = 0;
 
 // Serializes CC1101 access between the receive, transmit and join-button tasks;
 // the radio driver shares one SPI bus and its own packet buffers.
@@ -250,12 +253,15 @@ static SemaphoreHandle_t rf_mutex = nullptr;
 // callback holds the CHIP stack lock, and sendRFCommand() retries three times.
 static void queue_rf_command(IthoCommand cmd)
 {
-    // Timestamp first: rf_send_task reads the command, then the timestamp
-    pending_rf_cmd_ms.store(millis());
-    pending_rf_cmd.store((int32_t)cmd);
+    uint32_t now = millis();
+    taskENTER_CRITICAL(&rf_cmd_mux);
+    pending_rf_cmd = (int32_t)cmd;
+    pending_rf_cmd_ms = now;
+    taskEXIT_CRITICAL(&rf_cmd_mux);
 }
 
-// Map FanInfo (from 31DA response) to Matter FanMode
+// Map FanInfo (from 31DA response) to Matter FanMode. Auto states (0x18,
+// 0x19) can't come from an HRU300 and, like unknown values, aren't reported.
 static uint8_t fan_info_to_mode(uint8_t fan_info)
 {
     switch (fan_info)
@@ -265,9 +271,7 @@ static uint8_t fan_info_to_mode(uint8_t fan_info)
     case 0x02: return 2; // medium
     case 0x03: return 3; // high
     case 0x15: return 0; // away → off
-    case 0x18: return 5; // auto
-    case 0x19: return 5; // autonight → auto
-    default:   return 0; // unknown → off
+    default:   return FAN_MODE_NONE;
     }
 }
 
@@ -281,9 +285,7 @@ static uint8_t fan_info_to_percent(uint8_t fan_info)
     case 0x02: return 66;  // medium
     case 0x03: return 100; // high
     case 0x15: return 0;   // away → off
-    case 0x18: return 50;  // auto
-    case 0x19: return 50;  // autonight → auto
-    default:   return 0;   // unknown → off
+    default:   return 0;
     }
 }
 
@@ -293,22 +295,17 @@ static void update_fan_attributes(uint8_t fan_info)
     uint8_t new_mode = fan_info_to_mode(fan_info);
     uint8_t new_percent = fan_info_to_percent(fan_info);
 
+    if (new_mode == FAN_MODE_NONE)
+    {
+        ESP_LOGI(TAG, "FanInfo=0x%02X not a manual speed, ignored", fan_info);
+        return;
+    }
+
     ESP_LOGI(TAG, "FanInfo=0x%02X → FanMode=%d, Percent=%d%%", fan_info, new_mode, new_percent);
 
     lock::ScopedChipStackLock chip_lock(portMAX_DELAY);
 
-    if (new_mode == FAN_MODE_AUTO)
-    {
-        // The unit itself reports auto: keep showing it (the 2401 poll can't)
-        note_commanded_mode(FAN_MODE_AUTO);
-    }
-    else if (commanded_mode == FAN_MODE_AUTO)
-    {
-        if (millis() - commanded_ms < COMMAND_SETTLE_MS)
-            return; // report predates the Auto command
-        commanded_mode = FAN_MODE_NONE; // unit left auto (e.g. physical remote)
-    }
-    else if (!accept_reported_mode(new_mode))
+    if (!accept_reported_mode(new_mode))
     {
         ESP_LOGI(TAG, "FanInfo ignored: waiting for the unit to reach FanMode %d", commanded_mode);
         return;
@@ -342,22 +339,6 @@ static void update_fan_attributes_speed(int32_t demand_pct, int32_t abs_pct)
     uint8_t detent = fan_mode_to_percent(new_mode);
 
     lock::ScopedChipStackLock chip_lock(portMAX_DELAY);
-
-    if (commanded_mode == FAN_MODE_AUTO)
-    {
-        // In auto the unit runs its own demand control; the measured speed
-        // can't tell auto from manual, so keep FanMode at Auto (PercentSetting
-        // stays null, as the FanControl server set it) and only report speed.
-        ESP_LOGI(TAG, "Status speed: demand=%ld%% actual=%ld%% → Auto, PercentCurrent=%d%%",
-                 (long)demand_pct, (long)abs_pct, detent);
-        feedback_update_in_progress = true;
-        esp_matter_attr_val_t auto_val = esp_matter_enum8(FAN_MODE_AUTO);
-        esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &auto_val);
-        esp_matter_attr_val_t current_val = esp_matter_uint8(detent);
-        esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, PERCENT_CURRENT_ATTR_ID, &current_val);
-        feedback_update_in_progress = false;
-        return;
-    }
 
     if (!accept_reported_mode(new_mode))
     {
@@ -1032,16 +1013,17 @@ static void rf_send_task(void *arg)
     {
         vTaskDelay(pdMS_TO_TICKS(100));
 
-        int32_t cmd = pending_rf_cmd.load();
+        // Claim the command once the writes have been quiet for the debounce
+        uint32_t now = millis();
+        int32_t cmd = -1;
+        taskENTER_CRITICAL(&rf_cmd_mux);
+        if (pending_rf_cmd >= 0 && now - pending_rf_cmd_ms >= RF_SEND_DEBOUNCE_MS)
+        {
+            cmd = pending_rf_cmd;
+            pending_rf_cmd = -1;
+        }
+        taskEXIT_CRITICAL(&rf_cmd_mux);
         if (cmd < 0)
-            continue;
-
-        if (millis() - pending_rf_cmd_ms.load() < RF_SEND_DEBOUNCE_MS)
-            continue;
-
-        // Claim the command only if it wasn't replaced in the meantime; a
-        // different newer command stays pending and gets its own debounce.
-        if (!pending_rf_cmd.compare_exchange_strong(cmd, -1))
             continue;
 
         xSemaphoreTake(rf_mutex, portMAX_DELAY);
@@ -1152,8 +1134,8 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
         {
             queue_rf_command(cmd);
             // Record the speed the unit will settle on (Off runs at low,
-            // On at high, Smart is the unit's auto)
-            uint8_t target = (fan_mode == 0) ? 1 : (fan_mode == 4) ? 3 : (fan_mode == 6) ? FAN_MODE_AUTO : fan_mode;
+            // On and Smart at high)
+            uint8_t target = (fan_mode == 0) ? 1 : (fan_mode == 4 || fan_mode == 6) ? 3 : fan_mode;
             note_commanded_mode(target);
 
             // Mirror the percent attributes (writing different attributes than
@@ -1168,7 +1150,10 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
         }
         else
         {
-            ESP_LOGW(TAG, "Unknown fan mode: %d", fan_mode);
+            // Reject (the controller sees a write failure) rather than store
+            // a mode the unit can't run, e.g. Auto
+            ESP_LOGW(TAG, "Unsupported fan mode %d rejected", fan_mode);
+            return ESP_ERR_NOT_SUPPORTED;
         }
     }
     else if (type == POST_UPDATE && attribute_id == PERCENT_SETTING_ATTR_ID)

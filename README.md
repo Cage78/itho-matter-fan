@@ -19,11 +19,11 @@ Matter Controller (Apple Home / Google Home)
     Itho HRU 300 ventilation unit
 ```
 
-The ESP32 acts as a virtual RF remote control via the CC1101 module. Matter FanMode/PercentSetting commands are translated to Itho RF commands (opcode 0x22F1) and sent wirelessly to the HRU 300. Status is polled over I2C with the 0x2401 status query (the per-field format table is learned once via 0x2400); the absolute fanspeed field drives the reported mode so the controller always shows the current fan state. After a command, status reports that still show the old speed are held off until the unit reaches the new speed (at most 60 s), so the slider doesn't jump back while the fan ramps. Auto stays selected until another mode is chosen, because the measured speed can't tell auto from manual. RF reception is interrupt-driven via the CC1101 GDO pin; 31DA RF broadcasts are used as secondary feedback only when `ITHO_UNIT_ID` is set (see Virtual Remote ID).
+The ESP32 acts as a virtual RF remote control via the CC1101 module. Matter FanMode/PercentSetting commands are translated to Itho RF commands (opcode 0x22F1) and sent wirelessly to the HRU 300. Status is polled over I2C with the 0x2401 status query (the per-field format table is learned once via 0x2400); the absolute fanspeed field drives the reported mode so the controller always shows the current fan state. After a command, status reports that still show the old speed are held off until the unit reaches the new speed (at most 60 s), so the slider doesn't jump back while the fan ramps. RF reception is interrupt-driven via the CC1101 GDO pin; 31DA RF broadcasts are used as secondary feedback only when `ITHO_UNIT_ID` is set (see Virtual Remote ID).
 
 ### FanMode Mapping
 
-The HRU 300 cannot be turned off, so Off maps to Low and the percentage slider snaps to three detents (33/66/100):
+The HRU 300 has three speeds, cannot be turned off and has no auto mode (that needs CO2 sensors). The fan uses FanModeSequence 0 (Off/Low/Medium/High), so controllers don't offer Auto; an Auto write is rejected. Off can't be hidden (every Matter sequence includes it, and Apple Home uses it as the power button), so it maps to Low and the tile returns to Low. The percentage slider snaps to three detents (33/66/100):
 
 | Matter FanMode | Value | PercentSetting | Itho RF Command |
 |---|---|---|---|
@@ -31,7 +31,6 @@ The HRU 300 cannot be turned off, so Off maps to Low and the percentage slider s
 | Low | 1 | 33% | IthoLow (4) |
 | Medium | 2 | 66% | IthoMedium (5) |
 | High | 3 | 100% | IthoHigh (6) |
-| Auto | 5 | — | IthoAuto (11) |
 
 ### Filter Status
 
@@ -55,8 +54,8 @@ Four temperature sensors (bridged endpoints, named via NodeLabel): Outside, Supp
 | 0x02 | Medium | 2 | 66% |
 | 0x03 | High | 3 | 100% |
 | 0x15 | Away | 0 | 0% |
-| 0x18 | Auto | 5 | 50% |
-| 0x19 | AutoNight | 5 | 50% |
+
+Other FanInfo values (including the auto states 0x18/0x19) are ignored.
 
 ## Hardware Requirements
 
