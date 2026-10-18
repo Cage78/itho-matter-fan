@@ -77,6 +77,9 @@ static constexpr uint32_t TEMP_MEAS_VALUE_ATTR_ID = 0x0000;
 static constexpr uint32_t ON_OFF_CLUSTER_ID = 0x0006;
 static constexpr uint32_t ON_OFF_ATTR_ID = 0x0000;
 
+// Global attributes
+static constexpr uint32_t FEATURE_MAP_ATTR_ID = 0xFFFC;
+
 // Boolean State cluster (HRU Filter contact sensor)
 static constexpr uint32_t BOOLEAN_STATE_CLUSTER_ID = 0x0045;
 static constexpr uint32_t BOOLEAN_STATE_VALUE_ATTR_ID = 0x0000;
@@ -255,7 +258,8 @@ static void update_fan_attributes(uint8_t fan_info)
 
     feedback_update_in_progress = true;
 
-    esp_matter_attr_val_t mode_val = esp_matter_uint8(new_mode);
+    // FanMode is enum8; v1.5's attribute::update rejects mismatched val types
+    esp_matter_attr_val_t mode_val = esp_matter_enum8(new_mode);
     esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &mode_val);
 
     esp_matter_attr_val_t percent_val = esp_matter_uint8(new_percent);
@@ -284,7 +288,8 @@ static void update_fan_attributes_speed(int32_t demand_pct, int32_t abs_pct)
 
     feedback_update_in_progress = true;
 
-    esp_matter_attr_val_t mode_val = esp_matter_uint8(new_mode);
+    // FanMode is enum8; v1.5's attribute::update rejects mismatched val types
+    esp_matter_attr_val_t mode_val = esp_matter_enum8(new_mode);
     esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &mode_val);
 
     esp_matter_attr_val_t percent_val = esp_matter_uint8(detent);
@@ -894,7 +899,8 @@ static void i2c_poll_task(void *arg)
                     esp_matter_attr_val_t cond = esp_matter_uint8(filter_dirty ? 0 : 100);
                     esp_matter::attribute::update(fan_endpoint_id, HEPA_FILTER_MONITORING_CLUSTER_ID,
                                                   HEPA_CONDITION_ATTR_ID, &cond);
-                    esp_matter_attr_val_t ind = esp_matter_uint8(filter_dirty ? 2 : 0);
+                    // ChangeIndication is enum8; v1.5 rejects mismatched val types
+                    esp_matter_attr_val_t ind = esp_matter_enum8(filter_dirty ? 2 : 0);
                     esp_matter::attribute::update(fan_endpoint_id, HEPA_FILTER_MONITORING_CLUSTER_ID,
                                                   HEPA_CHANGE_INDICATION_ATTR_ID, &ind);
                 }
@@ -1098,7 +1104,7 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
         feedback_update_in_progress = true;
         esp_matter_attr_val_t setting_val = esp_matter_nullable_uint8(snapped);
         esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, PERCENT_SETTING_ATTR_ID, &setting_val);
-        esp_matter_attr_val_t mode_val = esp_matter_uint8(mode);
+        esp_matter_attr_val_t mode_val = esp_matter_enum8(mode);
         esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &mode_val);
         esp_matter_attr_val_t percent_val = esp_matter_uint8(snapped);
         esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, PERCENT_CURRENT_ATTR_ID, &percent_val);
@@ -1185,10 +1191,17 @@ extern "C" void app_main()
     // HEPA Filter Monitoring cluster on the same endpoint. The HRU300 has no
     // filter lifetime percentage, so Condition is mapped 100 (OK) / 0 (dirty)
     // and ChangeIndication OK/Critical from the 2401 error number in the poll
-    // task. (hepa_filter_monitoring::create already adds ChangeIndication.)
-    hepa_filter_monitoring::config_t hepa_config;
-    cluster_t *hepa = hepa_filter_monitoring::create(endpoint, &hepa_config, CLUSTER_FLAG_SERVER);
-    hepa_filter_monitoring::attribute::create_condition(hepa, 100);
+    // task. Created manually with plain store-backed attributes: esp-matter
+    // v1.5's hepa_filter_monitoring::create marks Condition/ChangeIndication
+    // ATTRIBUTE_FLAG_MANAGED_INTERNALLY (owned by chip's code-driven cluster,
+    // which requires a delegate instance we don't have), and attribute::update
+    // on them fails with ESP_ERR_NOT_SUPPORTED. Plain attributes behave like
+    // the v1.0 firmware and are served from the esp-matter store.
+    cluster_t *hepa = cluster::create(endpoint, HEPA_FILTER_MONITORING_CLUSTER_ID, CLUSTER_FLAG_SERVER);
+    attribute::create(hepa, FEATURE_MAP_ATTR_ID, ATTRIBUTE_FLAG_NONE, esp_matter_bitmap32(0));
+    attribute::create(hepa, HEPA_CONDITION_ATTR_ID, ATTRIBUTE_FLAG_NONE, esp_matter_uint8(100));
+    attribute::create(hepa, HEPA_CHANGE_INDICATION_ATTR_ID, ATTRIBUTE_FLAG_NONE, esp_matter_enum8(0));
+    global::attribute::create_cluster_revision(hepa, 1);
 
     fan_endpoint_id = endpoint::get_id(endpoint);
     ESP_LOGI(TAG, "Itho Fan Matter endpoint_id: %d", fan_endpoint_id);
@@ -1239,10 +1252,20 @@ extern "C" void app_main()
     // shows true as "Closed"). State is driven from the 2401 error number
     // in the poll task. Apple Home automations can notify on it.
     static char filter_name[] = "HRU Filter";
-    contact_sensor::config_t cs_config;
-    endpoint_t *f_ep = contact_sensor::create(node, &cs_config, ENDPOINT_FLAG_BRIDGE, NULL);
+    // Manual endpoint + cluster instead of contact_sensor::create: in
+    // esp-matter v1.5, boolean_state's StateValue is marked
+    // ATTRIBUTE_FLAG_MANAGED_INTERNALLY (owned by chip's code-driven
+    // BooleanStateCluster), so attribute::update on it fails with
+    // ESP_ERR_NOT_SUPPORTED. A plain store-backed attribute behaves like the
+    // v1.0 firmware. (Device type 0x0015 v2 = contact sensor.)
+    endpoint_t *f_ep = endpoint::create(node, ENDPOINT_FLAG_BRIDGE, NULL);
     if (f_ep != nullptr)
     {
+        endpoint::add_device_type(f_ep, 0x0015, 2);
+        cluster_t *bs = cluster::create(f_ep, BOOLEAN_STATE_CLUSTER_ID, CLUSTER_FLAG_SERVER);
+        attribute::create(bs, FEATURE_MAP_ATTR_ID, ATTRIBUTE_FLAG_NONE, esp_matter_bitmap32(0));
+        attribute::create(bs, BOOLEAN_STATE_VALUE_ATTR_ID, ATTRIBUTE_FLAG_NONE, esp_matter_bool(true));
+        global::attribute::create_cluster_revision(bs, 2);
         bridged_device_basic_information::config_t bdb_config;
         cluster_t *bdb = bridged_device_basic_information::create(f_ep, &bdb_config, CLUSTER_FLAG_SERVER);
         bridged_device_basic_information::attribute::create_node_label(bdb, filter_name, strlen(filter_name));
