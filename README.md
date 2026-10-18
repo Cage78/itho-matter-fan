@@ -40,7 +40,7 @@ The Air Purifier endpoint carries a **HEPA Filter Monitoring** cluster. The HRU 
 - Condition: 100 (OK) / 0 (dirty) — the unit reports no lifetime percentage
 - ChangeIndication: OK / Critical
 
-A bridged **contact sensor** named "HRU Filter" carries the same state as a fallback for controllers that don't render filter status (open = filters need cleaning; note Apple Home shows Boolean State true as "Closed", so the value is inverted).
+Verified rendering in Apple Home (filter change indication on the Air Purifier tile); the v1.0-era "HRU Filter" contact sensor fallback was removed.
 
 ### Sensors and Switches
 

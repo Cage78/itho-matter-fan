@@ -80,10 +80,6 @@ static constexpr uint32_t ON_OFF_ATTR_ID = 0x0000;
 // Global attributes
 static constexpr uint32_t FEATURE_MAP_ATTR_ID = 0xFFFC;
 
-// Boolean State cluster (HRU Filter contact sensor)
-static constexpr uint32_t BOOLEAN_STATE_CLUSTER_ID = 0x0045;
-static constexpr uint32_t BOOLEAN_STATE_VALUE_ATTR_ID = 0x0000;
-
 // HEPA Filter Monitoring cluster (on the air purifier endpoint)
 static constexpr uint32_t HEPA_FILTER_MONITORING_CLUSTER_ID = 0x0071;
 static constexpr uint32_t HEPA_CONDITION_ATTR_ID = 0x0000;
@@ -91,7 +87,6 @@ static constexpr uint32_t HEPA_CHANGE_INDICATION_ATTR_ID = 0x0002;
 
 static uint16_t temp_endpoint_ids[4] = {}; // outside, supply (inlet), extract, exhaust
 static uint16_t snb_endpoint_id = 0;       // Summer Night Boost switch
-static uint16_t filter_endpoint_id = 0;    // HRU Filter contact sensor
 
 // Dragging a speed slider produces a burst of PercentSetting writes, so the
 // resulting RF command is only transmitted once the writes stop arriving.
@@ -873,27 +868,17 @@ static void i2c_poll_task(void *arg)
                                               TEMP_MEAS_VALUE_ATTR_ID, &tv);
             }
 
-            // Filter status contact sensor: the HRU300 signals W01 (clean
-            // filters, blinking status LED) as error number 1 in the 2401
-            // status — it does not answer the CVE-era 0x31D9 query. Mapping
-            // calibrated against a live W01 (error 0 → 1, status 8).
-            // Contact sensor convention: open = filters need cleaning. Apple
-            // Home shows Boolean State true as "Closed", so the value is
-            // inverted (verified on a live W01).
+            // Filter status: the HRU300 signals W01 (clean filters, blinking
+            // status LED) as error number 1 in the 2401 status — it does not
+            // answer the CVE-era 0x31D9 query. Mapping calibrated against a
+            // live W01 (error 0 → 1, status 8). Reported via HEPA Filter
+            // Monitoring on the air purifier endpoint: Condition 100 = OK /
+            // 0 = dirty; ChangeIndication 0 = OK / 2 = Critical.
             bool filter_dirty = (st.error == 1);
             static int last_filter_dirty = -1;
             if ((int)filter_dirty != last_filter_dirty)
             {
                 last_filter_dirty = (int)filter_dirty;
-                // Bridged contact sensor (fallback; open = filters need cleaning)
-                if (filter_endpoint_id != 0)
-                {
-                    esp_matter_attr_val_t fv = esp_matter_bool(!filter_dirty);
-                    esp_matter::attribute::update(filter_endpoint_id, BOOLEAN_STATE_CLUSTER_ID,
-                                                  BOOLEAN_STATE_VALUE_ATTR_ID, &fv);
-                }
-                // HEPA Filter Monitoring on the air purifier endpoint:
-                // Condition 100 = OK / 0 = dirty; ChangeIndication 2 = Critical
                 if (fan_endpoint_id != 0)
                 {
                     esp_matter_attr_val_t cond = esp_matter_uint8(filter_dirty ? 0 : 100);
@@ -1247,32 +1232,9 @@ extern "C" void app_main()
     }
     ESP_LOGI(TAG, "Summer Night Boost endpoint_id: %d", snb_endpoint_id);
 
-    // HRU Filter status as a contact sensor (Boolean State cluster):
-    // open = filters need cleaning (Boolean State is inverted: Apple Home
-    // shows true as "Closed"). State is driven from the 2401 error number
-    // in the poll task. Apple Home automations can notify on it.
-    static char filter_name[] = "HRU Filter";
-    // Manual endpoint + cluster instead of contact_sensor::create: in
-    // esp-matter v1.5, boolean_state's StateValue is marked
-    // ATTRIBUTE_FLAG_MANAGED_INTERNALLY (owned by chip's code-driven
-    // BooleanStateCluster), so attribute::update on it fails with
-    // ESP_ERR_NOT_SUPPORTED. A plain store-backed attribute behaves like the
-    // v1.0 firmware. (Device type 0x0015 v2 = contact sensor.)
-    endpoint_t *f_ep = endpoint::create(node, ENDPOINT_FLAG_BRIDGE, NULL);
-    if (f_ep != nullptr)
-    {
-        endpoint::add_device_type(f_ep, 0x0015, 2);
-        cluster_t *bs = cluster::create(f_ep, BOOLEAN_STATE_CLUSTER_ID, CLUSTER_FLAG_SERVER);
-        attribute::create(bs, FEATURE_MAP_ATTR_ID, ATTRIBUTE_FLAG_NONE, esp_matter_bitmap32(0));
-        attribute::create(bs, BOOLEAN_STATE_VALUE_ATTR_ID, ATTRIBUTE_FLAG_NONE, esp_matter_bool(true));
-        global::attribute::create_cluster_revision(bs, 2);
-        bridged_device_basic_information::config_t bdb_config;
-        cluster_t *bdb = bridged_device_basic_information::create(f_ep, &bdb_config, CLUSTER_FLAG_SERVER);
-        bridged_device_basic_information::attribute::create_node_label(bdb, filter_name, strlen(filter_name));
-        endpoint::set_parent_endpoint(f_ep, agg);
-        filter_endpoint_id = endpoint::get_id(f_ep);
-    }
-    ESP_LOGI(TAG, "HRU Filter endpoint_id: %d", filter_endpoint_id);
+    // Filter status is reported only via the HEPA Filter Monitoring cluster on
+    // the air purifier endpoint (verified rendering in Apple Home); the v1.0
+    // "HRU Filter" contact sensor fallback was retired.
 
     // Start Matter
     esp_matter::start(NULL);
