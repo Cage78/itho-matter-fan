@@ -22,6 +22,7 @@
 #include <Arduino.h>
 #include "IthoCC1101.h"
 
+#include <atomic>
 #include <esp_err.h>
 #include <esp_log.h>
 #include <nvs_flash.h>
@@ -48,6 +49,12 @@ static IthoCC1101 itho;
 #endif
 #ifndef ITHO_REMOTE_ID
 #define ITHO_REMOTE_ID 0xDE, 0xAD, 0x01 // placeholder — set your own in local_config.h
+#endif
+// Optional: RF ID of the ventilation unit itself. 31DA status broadcasts are
+// only used as feedback when they come from this ID; without it they are
+// ignored (any Itho device in range broadcasts 31DA).
+#ifdef ITHO_UNIT_ID
+static const uint8_t itho_unit_id[3] = {ITHO_UNIT_ID};
 #endif
 
 // Override Arduino's weak btInUse() so initArduino() does NOT release
@@ -193,11 +200,47 @@ static uint8_t fan_mode_to_percent(uint8_t fan_mode)
 // Set while attributes are written from unit feedback. esp_matter's update()
 // runs the PRE_UPDATE callback synchronously, so without this guard every
 // status report would be echoed back to the unit as an RF command.
-static volatile bool feedback_update_in_progress = false;
+// Only set/cleared while holding the CHIP stack lock: controller writes are
+// processed under that lock too, so they can never observe the flag raised
+// by another task's feedback block (and be dropped as "feedback").
+static bool feedback_update_in_progress = false;
+
+// Speed last commanded through Matter, as a FanMode (1-3, or FAN_MODE_AUTO),
+// or FAN_MODE_NONE once the unit's reports are authoritative again. Guarded
+// by the CHIP stack lock (Matter callbacks already run under it).
+static constexpr uint8_t FAN_MODE_NONE = 0xFF;
+static constexpr uint8_t FAN_MODE_AUTO = 5;
+static uint8_t commanded_mode = FAN_MODE_NONE;
+static uint32_t commanded_ms = 0;
+// The unit takes several poll cycles to ramp to a new speed, and a status
+// poll in between would snap the controller's slider back to the old speed.
+// Reports that disagree with a fresh command are held off until they match
+// or this long has passed (the RF command may have been lost).
+static constexpr uint32_t COMMAND_SETTLE_MS = 60000;
+
+static void note_commanded_mode(uint8_t mode)
+{
+    commanded_mode = mode;
+    commanded_ms = millis();
+}
+
+// Whether a manual speed reported by the unit may overwrite the attributes.
+// Caller holds the CHIP stack lock and has handled FAN_MODE_AUTO itself.
+static bool accept_reported_mode(uint8_t reported)
+{
+    if (commanded_mode == FAN_MODE_NONE)
+        return true;
+    if (reported == commanded_mode || millis() - commanded_ms >= COMMAND_SETTLE_MS)
+    {
+        commanded_mode = FAN_MODE_NONE;
+        return true;
+    }
+    return false;
+}
 
 // Command awaiting transmission by rf_send_task. -1 means nothing pending.
-static volatile int32_t pending_rf_cmd = -1;
-static volatile uint32_t pending_rf_cmd_ms = 0;
+static std::atomic<int32_t> pending_rf_cmd{-1};
+static std::atomic<uint32_t> pending_rf_cmd_ms{0};
 
 // Serializes CC1101 access between the receive, transmit and join-button tasks;
 // the radio driver shares one SPI bus and its own packet buffers.
@@ -207,8 +250,9 @@ static SemaphoreHandle_t rf_mutex = nullptr;
 // callback holds the CHIP stack lock, and sendRFCommand() retries three times.
 static void queue_rf_command(IthoCommand cmd)
 {
-    pending_rf_cmd_ms = millis();
-    pending_rf_cmd = (int32_t)cmd;
+    // Timestamp first: rf_send_task reads the command, then the timestamp
+    pending_rf_cmd_ms.store(millis());
+    pending_rf_cmd.store((int32_t)cmd);
 }
 
 // Map FanInfo (from 31DA response) to Matter FanMode
@@ -251,6 +295,25 @@ static void update_fan_attributes(uint8_t fan_info)
 
     ESP_LOGI(TAG, "FanInfo=0x%02X → FanMode=%d, Percent=%d%%", fan_info, new_mode, new_percent);
 
+    lock::ScopedChipStackLock chip_lock(portMAX_DELAY);
+
+    if (new_mode == FAN_MODE_AUTO)
+    {
+        // The unit itself reports auto: keep showing it (the 2401 poll can't)
+        note_commanded_mode(FAN_MODE_AUTO);
+    }
+    else if (commanded_mode == FAN_MODE_AUTO)
+    {
+        if (millis() - commanded_ms < COMMAND_SETTLE_MS)
+            return; // report predates the Auto command
+        commanded_mode = FAN_MODE_NONE; // unit left auto (e.g. physical remote)
+    }
+    else if (!accept_reported_mode(new_mode))
+    {
+        ESP_LOGI(TAG, "FanInfo ignored: waiting for the unit to reach FanMode %d", commanded_mode);
+        return;
+    }
+
     feedback_update_in_progress = true;
 
     // FanMode is enum8; v1.5's attribute::update rejects mismatched val types
@@ -277,6 +340,31 @@ static void update_fan_attributes_speed(int32_t demand_pct, int32_t abs_pct)
 {
     uint8_t new_mode = fan_status_pct_to_mode(abs_pct);
     uint8_t detent = fan_mode_to_percent(new_mode);
+
+    lock::ScopedChipStackLock chip_lock(portMAX_DELAY);
+
+    if (commanded_mode == FAN_MODE_AUTO)
+    {
+        // In auto the unit runs its own demand control; the measured speed
+        // can't tell auto from manual, so keep FanMode at Auto (PercentSetting
+        // stays null, as the FanControl server set it) and only report speed.
+        ESP_LOGI(TAG, "Status speed: demand=%ld%% actual=%ld%% → Auto, PercentCurrent=%d%%",
+                 (long)demand_pct, (long)abs_pct, detent);
+        feedback_update_in_progress = true;
+        esp_matter_attr_val_t auto_val = esp_matter_enum8(FAN_MODE_AUTO);
+        esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &auto_val);
+        esp_matter_attr_val_t current_val = esp_matter_uint8(detent);
+        esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, PERCENT_CURRENT_ATTR_ID, &current_val);
+        feedback_update_in_progress = false;
+        return;
+    }
+
+    if (!accept_reported_mode(new_mode))
+    {
+        ESP_LOGI(TAG, "Status speed: actual=%ld%% (FanMode %d), waiting for the unit to reach FanMode %d",
+                 (long)abs_pct, new_mode, commanded_mode);
+        return;
+    }
 
     ESP_LOGI(TAG, "Status speed: demand=%ld%% actual=%ld%% → FanMode=%d, PercentSetting=%d%%",
              (long)demand_pct, (long)abs_pct, new_mode, detent);
@@ -720,12 +808,13 @@ static bool i2c_set_setting(uint8_t index, int32_t value, uint8_t length)
 
 // Summer Night Boost switch state. The setting index depends on the unit's
 // settings version: 95 for v6/8/9, 96 for v10 (ithowifi hru250_300.h maps).
-static volatile int snb_pending = -1; // -1 = none, 0/1 = write requested
-static int snb_setting_index = -1;    // -1 = not located yet
+static std::atomic<int> snb_pending{-1}; // -1 = none, 0/1 = write requested
+static int snb_setting_index = -1;       // -1 = not located yet
 static uint8_t snb_value_length = 1;
 
 static void snb_update_attribute(bool on)
 {
+    lock::ScopedChipStackLock chip_lock(portMAX_DELAY);
     feedback_update_in_progress = true;
     esp_matter_attr_val_t v = esp_matter_bool(on);
     esp_matter::attribute::update(snb_endpoint_id, ON_OFF_CLUSTER_ID, ON_OFF_ATTR_ID, &v);
@@ -755,10 +844,9 @@ static void snb_poll(void)
         return;
     }
 
-    if (snb_pending >= 0)
+    int v = snb_pending.exchange(-1);
+    if (v >= 0)
     {
-        int v = snb_pending;
-        snb_pending = -1;
         if (i2c_set_setting((uint8_t)snb_setting_index, v, snb_value_length))
         {
             ESP_LOGI(TAG, "Summer Night Boost set to %s", v ? "on" : "off");
@@ -790,8 +878,21 @@ static void rf31da_callback(const uint8_t *payload, uint8_t len, uint8_t srcId0,
         return;
 
     uint8_t fan_info = payload[0];
+#ifdef ITHO_UNIT_ID
+    if (srcId0 != itho_unit_id[0] || srcId1 != itho_unit_id[1] || srcId2 != itho_unit_id[2])
+    {
+        ESP_LOGD(TAG, "RF 31DA from %02X:%02X:%02X ignored (not ITHO_UNIT_ID)", srcId0, srcId1, srcId2);
+        return;
+    }
     ESP_LOGI(TAG, "RF 31DA feedback: FanInfo=0x%02X", fan_info);
     update_fan_attributes(fan_info);
+#else
+    // Observed on a live HRU300 at medium speed: periodic 31DA reporting
+    // FanInfo 0x00 (off), so the sender can't be assumed to be our unit.
+    ESP_LOGI(TAG, "RF 31DA from %02X:%02X:%02X ignored (FanInfo=0x%02X); set ITHO_UNIT_ID "
+                  "in local_config.h to use the unit's own broadcasts",
+             srcId0, srcId1, srcId2, fan_info);
+#endif
 }
 
 // GDO interrupt flag — the CC1101 signals a received packet on GPIO 4
@@ -931,14 +1032,17 @@ static void rf_send_task(void *arg)
     {
         vTaskDelay(pdMS_TO_TICKS(100));
 
-        int32_t cmd = pending_rf_cmd;
+        int32_t cmd = pending_rf_cmd.load();
         if (cmd < 0)
             continue;
 
-        if (millis() - pending_rf_cmd_ms < RF_SEND_DEBOUNCE_MS)
+        if (millis() - pending_rf_cmd_ms.load() < RF_SEND_DEBOUNCE_MS)
             continue;
 
-        pending_rf_cmd = -1;
+        // Claim the command only if it wasn't replaced in the meantime; a
+        // different newer command stays pending and gets its own debounce.
+        if (!pending_rf_cmd.compare_exchange_strong(cmd, -1))
+            continue;
 
         xSemaphoreTake(rf_mutex, portMAX_DELAY);
         itho.sendRFCommand(0, (IthoCommand)cmd);
@@ -1025,8 +1129,9 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
     {
         if (type == POST_UPDATE && attribute_id == ON_OFF_ATTR_ID && !feedback_update_in_progress)
         {
-            snb_pending = val->val.b ? 1 : 0;
-            ESP_LOGI(TAG, "Summer Night Boost write: %s", snb_pending ? "on" : "off");
+            int on = val->val.b ? 1 : 0;
+            snb_pending.store(on);
+            ESP_LOGI(TAG, "Summer Night Boost write: %s", on ? "on" : "off");
         }
         return ESP_OK;
     }
@@ -1046,6 +1151,10 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
         if (cmd != IthoUnknown)
         {
             queue_rf_command(cmd);
+            // Record the speed the unit will settle on (Off runs at low,
+            // On at high, Smart is the unit's auto)
+            uint8_t target = (fan_mode == 0) ? 1 : (fan_mode == 4) ? 3 : (fan_mode == 6) ? FAN_MODE_AUTO : fan_mode;
+            note_commanded_mode(target);
 
             // Mirror the percent attributes (writing different attributes than
             // the in-flight FanMode write, so no overwrite conflict).
@@ -1081,6 +1190,7 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
                  requested, snapped, mode, (int)cmd);
 
         queue_rf_command(cmd);
+        note_commanded_mode(mode);
 
         // Snap PercentSetting to the nearest detent and mirror FanMode and
         // PercentCurrent, so every controller shows the same speed. This runs
@@ -1123,10 +1233,35 @@ static void ensure_factory_identity()
     }
 }
 
+// Unrecoverable startup failure: log, give the log time to drain, reboot.
+[[noreturn]] static void startup_failed(const char *what)
+{
+    ESP_LOGE(TAG, "HIER startup failed: %s — rebooting", what);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    abort();
+}
+
+static void start_task(TaskFunction_t fn, const char *name, uint32_t stack, UBaseType_t prio)
+{
+    if (xTaskCreate(fn, name, stack, nullptr, prio, nullptr) != pdPASS)
+        startup_failed(name);
+}
+
 extern "C" void app_main()
 {
-    // Initialize NVS
-    nvs_flash_init();
+    // Initialize NVS. A full or format-changed partition can't be used as is;
+    // erasing it loses the Matter pairing, but the device can be re-paired,
+    // whereas without NVS it can't commission or keep a fabric at all.
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_LOGW(TAG, "HIER NVS unusable (%s), erasing — the device must be re-paired",
+                 esp_err_to_name(nvs_err));
+        if (nvs_flash_erase() == ESP_OK)
+            nvs_err = nvs_flash_init();
+    }
+    if (nvs_err != ESP_OK)
+        startup_failed("NVS init");
 
     // Initialize Arduino framework (needed for SPI, delay, etc.)
     initArduino();
@@ -1134,10 +1269,7 @@ extern "C" void app_main()
     // Guard CC1101 access before any task can reach the radio
     rf_mutex = xSemaphoreCreateMutex();
     if (rf_mutex == nullptr)
-    {
-        ESP_LOGE(TAG, "Failed to create RF mutex");
-        return;
-    }
+        startup_failed("RF mutex");
 
     // Initialize CC1101 RF module
     itho.init();
@@ -1158,6 +1290,8 @@ extern "C" void app_main()
     // Create Matter node
     node::config_t node_config;
     node_t *node = node::create(&node_config, app_attribute_update_cb, app_identification_cb);
+    if (node == nullptr)
+        startup_failed("Matter node");
 
     // Create the fan endpoint as an Air Purifier device type (esp-matter v1.5):
     // air_purifier::create() adds Identify + FanControl with the same attribute
@@ -1168,6 +1302,8 @@ extern "C" void app_main()
     ap_config.fan_control.percent_setting = nullable<uint8_t>(0);
     ap_config.fan_control.percent_current = 0;
     endpoint_t *endpoint = air_purifier::create(node, &ap_config, ENDPOINT_FLAG_NONE, NULL);
+    if (endpoint == nullptr)
+        startup_failed("air purifier endpoint");
 
     // Groups cluster (parity with the v1.0 manual fan endpoint)
     cluster::groups::config_t groups_config;
@@ -1196,6 +1332,8 @@ extern "C" void app_main()
     // NodeLabel Apple Home displays as the accessory name.
     aggregator::config_t agg_config;
     endpoint_t *agg = aggregator::create(node, &agg_config, ENDPOINT_FLAG_NONE, NULL);
+    if (agg == nullptr)
+        startup_failed("aggregator endpoint");
 
     // Temperature sensors from I2C 2401 fields 2/5/6/7 (labels per ithowifi
     // hru250_300.h): outside, supply (inlet), extract, exhaust
@@ -1237,7 +1375,8 @@ extern "C" void app_main()
     // "HRU Filter" contact sensor fallback was retired.
 
     // Start Matter
-    esp_matter::start(NULL);
+    if (esp_matter::start(NULL) != ESP_OK)
+        startup_failed("Matter start");
 
     // Set VendorName/ProductName in the fctry namespace (one-time)
     ensure_factory_identity();
@@ -1248,17 +1387,17 @@ extern "C" void app_main()
     esp_matter::console::init();
 #endif
 
-    // Create CC1101 RF receive task
-    xTaskCreate(cc1101_task, "cc1101_rx", 4096, nullptr, 5, nullptr);
+    // CC1101 RF receive task
+    start_task(cc1101_task, "cc1101_rx", 4096, 5);
 
-    // Create I2C status polling task
-    xTaskCreate(i2c_poll_task, "i2c_poll", 6144, nullptr, 4, nullptr);
+    // I2C status polling task
+    start_task(i2c_poll_task, "i2c_poll", 6144, 4);
 
-    // Create RF transmit task (debounced commands from Matter writes)
-    xTaskCreate(rf_send_task, "rf_send", 4096, nullptr, 5, nullptr);
+    // RF transmit task (debounced commands from Matter writes)
+    start_task(rf_send_task, "rf_send", 4096, 5);
 
-    // Create fail safe button task (HRU300 join/pairing)
-    xTaskCreate(button_task, "btn_join", 3072, nullptr, 3, nullptr);
+    // Fail safe button task (HRU300 join/pairing)
+    start_task(button_task, "btn_join", 3072, 3);
 
     ESP_LOGI(TAG, "Itho HRU300 Matter Fan started (RF commands + I2C status polling + join button)");
 }

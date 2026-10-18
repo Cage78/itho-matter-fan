@@ -19,7 +19,7 @@ Matter Controller (Apple Home / Google Home)
     Itho HRU 300 ventilation unit
 ```
 
-The ESP32 acts as a virtual RF remote control via the CC1101 module. Matter FanMode/PercentSetting commands are translated to Itho RF commands (opcode 0x22F1) and sent wirelessly to the HRU 300. Status is polled over I2C with the 0x2401 status query (the per-field format table is learned once via 0x2400); the absolute fanspeed field drives the reported mode so the controller always shows the current fan state. RF reception is interrupt-driven via the CC1101 GDO pin, and the unit's 31DA RF broadcasts are received as a secondary feedback source.
+The ESP32 acts as a virtual RF remote control via the CC1101 module. Matter FanMode/PercentSetting commands are translated to Itho RF commands (opcode 0x22F1) and sent wirelessly to the HRU 300. Status is polled over I2C with the 0x2401 status query (the per-field format table is learned once via 0x2400); the absolute fanspeed field drives the reported mode so the controller always shows the current fan state. After a command, status reports that still show the old speed are held off until the unit reaches the new speed (at most 60 s), so the slider doesn't jump back while the fan ramps. Auto stays selected until another mode is chosen, because the measured speed can't tell auto from manual. RF reception is interrupt-driven via the CC1101 GDO pin; 31DA RF broadcasts are used as secondary feedback only when `ITHO_UNIT_ID` is set (see Virtual Remote ID).
 
 ### FanMode Mapping
 
@@ -160,6 +160,8 @@ The firmware needs the RF remote ID your HRU 300 listens to. Copy `main/local_co
 ```
 
 The easiest source is a physical remote you already use: sniff its ID from its RF traffic (the ithowifi firmware's RF log shows it). Using an existing remote's ID means no joining is needed — the HRU 300 already trusts it. You can also pick a fresh ID and join it to the unit (see below).
+
+Optionally set `ITHO_UNIT_ID` to the ventilation unit's own RF ID to use its 31DA status broadcasts as extra feedback. Without it, 31DA messages are ignored, because any Itho device in range sends them (one observed sender reported "off" while the HRU 300 ran at medium). Each ignored message is logged with its sender ID, which helps find the right one.
 
 ### Pairing with the HRU 300
 

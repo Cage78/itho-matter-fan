@@ -2291,8 +2291,10 @@ void IthoCC1101::handle31DA(IthoPacket *packetPtr)
   uint8_t byte1 = tempID >> 8 & 0xFF;
   uint8_t byte2 = tempID & 0xFF;
 
-  // Capture RF status data from all sources (before registered-device check)
-  if (packetPtr->len > 1 && rf31DACallback)
+  // Capture RF status data from all sources (before registered-device check).
+  // CRC_FILTER is off, so packets with a bad checksum still reach this point;
+  // their payload is garbage and must not be reported as fan status.
+  if (packetPtr->error == 0 && packetPtr->len > 1 && rf31DACallback)
     rf31DACallback(&packetPtr->dataDecoded[packetPtr->payloadPos], packetPtr->len, byte0, byte1, byte2);
 
   if (!checkRFDevice(byte0, byte1, byte2))
