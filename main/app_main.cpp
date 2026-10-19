@@ -237,14 +237,14 @@ static bool accept_reported_mode(uint8_t reported)
     return false;
 }
 
-// Apple Home scenes write PercentSetting and then, ~170 ms later in a separate
-// request, a FanMode that doesn't match it (High for a 66% scene). A FanMode
-// write that follows a PercentSetting write this closely is treated as part of
-// the same scene and must not override the speed it set.
+// Apple Home maps its air purifier "Manual" state to FanMode High (3). It
+// writes that ~170 ms after a scene's PercentSetting (so a 66% scene would end
+// at High) and right after a rejected Auto write (so tapping Auto would jump to
+// High). A FanMode write this soon after either one must not change the speed.
 // Guarded by the CHIP stack lock (only touched from Matter callbacks).
-static constexpr uint32_t SCENE_WRITE_WINDOW_MS = 2000;
-static uint32_t percent_write_ms = 0;
-static uint8_t percent_write_mode = FAN_MODE_NONE;
+static constexpr uint32_t SPEED_HOLD_MS = 2000;
+static uint32_t speed_hold_ms = 0;
+static uint8_t speed_hold_mode = FAN_MODE_NONE;
 static bool restore_fan_mode = false;
 
 // Command awaiting transmission by rf_send_task. -1 means nothing pending.
@@ -1146,13 +1146,13 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
             // Smart at high)
             uint8_t target = (fan_mode == 0) ? 1 : (fan_mode == 4 || fan_mode == 6) ? 3 : fan_mode;
 
-            if (percent_write_mode != FAN_MODE_NONE && target != percent_write_mode &&
-                millis() - percent_write_ms < SCENE_WRITE_WINDOW_MS)
+            if (speed_hold_mode != FAN_MODE_NONE && target != speed_hold_mode &&
+                millis() - speed_hold_ms < SPEED_HOLD_MS)
             {
                 // Accept the write (a failure would mark the scene as failed)
                 // but put FanMode back once it is stored, in POST_UPDATE.
-                ESP_LOGI(TAG, "FanMode write %d ignored: follows a PercentSetting write for FanMode %d",
-                         fan_mode, percent_write_mode);
+                ESP_LOGI(TAG, "FanMode write %d ignored: keeping FanMode %d from the previous write",
+                         fan_mode, speed_hold_mode);
                 restore_fan_mode = true;
                 return ESP_OK;
             }
@@ -1176,24 +1176,32 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
             // Reject (the controller sees a write failure) rather than store
             // a mode the unit can't run, e.g. Auto
             ESP_LOGW(TAG, "Unsupported fan mode %d rejected", fan_mode);
+            esp_matter_attr_val_t current;
+            if (esp_matter::attribute::get_val(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &current) == ESP_OK &&
+                current.val.u8 >= 1 && current.val.u8 <= 3)
+            {
+                speed_hold_mode = current.val.u8;
+                speed_hold_ms = millis();
+            }
             return ESP_ERR_NOT_SUPPORTED;
         }
     }
     else if (type == POST_UPDATE && attribute_id == FAN_MODE_ATTR_ID && restore_fan_mode &&
-             millis() - percent_write_ms < SCENE_WRITE_WINDOW_MS)
+             millis() - speed_hold_ms < SPEED_HOLD_MS)
     {
         // chip's fan-control server stores On (4) as a nested High write and
         // drops the original, so the flag is time-limited in case no
         // POST_UPDATE follows the write that raised it.
         restore_fan_mode = false;
         feedback_update_in_progress = true;
-        esp_matter_attr_val_t mode_val = esp_matter_enum8(percent_write_mode);
+        esp_matter_attr_val_t mode_val = esp_matter_enum8(speed_hold_mode);
         esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &mode_val);
         feedback_update_in_progress = false;
     }
     else if (type == POST_UPDATE && attribute_id == PERCENT_SETTING_ATTR_ID)
     {
-        // Apple Home drives the fan exclusively through PercentSetting, never FanMode.
+        // Apple Home sets the speed only through PercentSetting; its FanMode
+        // writes carry the Manual/Auto state.
         // The attribute is nullable and spec-limited to 0-100, so anything above
         // 100 is either the 0xFF null marker or invalid — nothing to act on.
         if (val->val.u8 > 100)
@@ -1211,8 +1219,8 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 
         queue_rf_command(cmd);
         note_commanded_mode(mode);
-        percent_write_mode = mode;
-        percent_write_ms = millis();
+        speed_hold_mode = mode;
+        speed_hold_ms = millis();
 
         // Snap PercentSetting to the nearest detent and mirror FanMode and
         // PercentCurrent, so every controller shows the same speed. This runs
