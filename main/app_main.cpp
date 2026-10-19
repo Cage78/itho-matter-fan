@@ -237,6 +237,16 @@ static bool accept_reported_mode(uint8_t reported)
     return false;
 }
 
+// Apple Home scenes write PercentSetting and then, ~170 ms later in a separate
+// request, a FanMode that doesn't match it (High for a 66% scene). A FanMode
+// write that follows a PercentSetting write this closely is treated as part of
+// the same scene and must not override the speed it set.
+// Guarded by the CHIP stack lock (only touched from Matter callbacks).
+static constexpr uint32_t SCENE_WRITE_WINDOW_MS = 2000;
+static uint32_t percent_write_ms = 0;
+static uint8_t percent_write_mode = FAN_MODE_NONE;
+static bool restore_fan_mode = false;
+
 // Command awaiting transmission by rf_send_task. -1 means nothing pending.
 // Command and timestamp change together under rf_cmd_mux: with separate
 // atomics, a repeat of the same command landing just before the claim would
@@ -1132,10 +1142,23 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 
         if (cmd != IthoUnknown)
         {
-            queue_rf_command(cmd);
-            // Record the speed the unit will settle on (Off runs at low,
-            // On and Smart at high)
+            // The speed the unit will settle on (Off runs at low, On and
+            // Smart at high)
             uint8_t target = (fan_mode == 0) ? 1 : (fan_mode == 4 || fan_mode == 6) ? 3 : fan_mode;
+
+            if (percent_write_mode != FAN_MODE_NONE && target != percent_write_mode &&
+                millis() - percent_write_ms < SCENE_WRITE_WINDOW_MS)
+            {
+                // Accept the write (a failure would mark the scene as failed)
+                // but put FanMode back once it is stored, in POST_UPDATE.
+                ESP_LOGI(TAG, "FanMode write %d ignored: follows a PercentSetting write for FanMode %d",
+                         fan_mode, percent_write_mode);
+                restore_fan_mode = true;
+                return ESP_OK;
+            }
+
+            restore_fan_mode = false;
+            queue_rf_command(cmd);
             note_commanded_mode(target);
 
             // Mirror the percent attributes (writing different attributes than
@@ -1155,6 +1178,18 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
             ESP_LOGW(TAG, "Unsupported fan mode %d rejected", fan_mode);
             return ESP_ERR_NOT_SUPPORTED;
         }
+    }
+    else if (type == POST_UPDATE && attribute_id == FAN_MODE_ATTR_ID && restore_fan_mode &&
+             millis() - percent_write_ms < SCENE_WRITE_WINDOW_MS)
+    {
+        // chip's fan-control server stores On (4) as a nested High write and
+        // drops the original, so the flag is time-limited in case no
+        // POST_UPDATE follows the write that raised it.
+        restore_fan_mode = false;
+        feedback_update_in_progress = true;
+        esp_matter_attr_val_t mode_val = esp_matter_enum8(percent_write_mode);
+        esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &mode_val);
+        feedback_update_in_progress = false;
     }
     else if (type == POST_UPDATE && attribute_id == PERCENT_SETTING_ATTR_ID)
     {
@@ -1176,6 +1211,8 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 
         queue_rf_command(cmd);
         note_commanded_mode(mode);
+        percent_write_mode = mode;
+        percent_write_ms = millis();
 
         // Snap PercentSetting to the nearest detent and mirror FanMode and
         // PercentCurrent, so every controller shows the same speed. This runs
