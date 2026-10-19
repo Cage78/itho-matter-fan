@@ -23,14 +23,15 @@ The ESP32 acts as a virtual RF remote control via the CC1101 module. Matter FanM
 
 ### FanMode Mapping
 
-The HRU 300 has three speeds, cannot be turned off and has no auto mode (that needs CO2 sensors). The fan uses FanModeSequence 0 (Off/Low/Medium/High), so controllers don't offer Auto; an Auto write is rejected. Off can't be hidden (every Matter sequence includes it, and Apple Home uses it as the power button), so it maps to Low and the tile returns to Low. The percentage slider snaps to three detents (33/66/100):
+The HRU 300 has three speeds, cannot be turned off and has no auto mode (that needs CO2 sensors). The speed is set only through PercentSetting, which snaps to three detents:
 
-| Matter FanMode | Value | PercentSetting | Itho RF Command |
-|---|---|---|---|
-| Off | 0 | 0-33% | IthoLow (4) |
-| Low | 1 | 33% | IthoLow (4) |
-| Medium | 2 | 66% | IthoMedium (5) |
-| High | 3 | 100% | IthoHigh (6) |
+| PercentSetting | Reported FanMode | Itho RF Command |
+|---|---|---|
+| 0-33% → 33% | Low (1) | IthoLow (4) |
+| 34-66% → 66% | Medium (2) | IthoMedium (5) |
+| 67-100% → 100% | High (3) | IthoHigh (6) |
+
+FanMode writes from controllers never change the speed. Apple Home shows the Air Purifier with a Manual/Auto choice and maps those onto FanMode: it writes High (3) for Manual after every scene and after a failed Auto attempt, and sometimes Off before a scene's speed. Acting on these would override the speed the scene or slider just set. So Auto (5) is rejected (Home then falls back to Manual), and every other FanMode write is accepted but reverted to the mode matching the current speed. The fan uses FanModeSequence 0 (Off/Low/Medium/High); Off can't be hidden because every Matter sequence includes it.
 
 ### Filter Status
 

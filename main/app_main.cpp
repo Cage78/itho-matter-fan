@@ -14,7 +14,8 @@
  * The HRU300 cannot be turned off and has no auto mode (that needs CO2
  * sensors); speeds are low/medium/high:
  *   PercentSetting detents: 33 = low, 66 = medium, 100 = high (0% → low)
- *   FanMode: 0 Off → low, 1 Low, 2 Medium, 3 High (Auto writes are rejected)
+ *   FanMode: reported as 1 Low, 2 Medium, 3 High; controller writes never
+ *            change the speed (Auto is rejected, other modes are reverted)
  * Mode from status (absolute fanspeed %): <1 off, <32 low, <60 medium, else high
  */
 
@@ -75,8 +76,8 @@ static constexpr uint32_t FAN_CONTROL_CLUSTER_ID = 0x0202;
 static constexpr uint32_t FAN_MODE_ATTR_ID = 0x0000;
 static constexpr uint32_t PERCENT_SETTING_ATTR_ID = 0x0002;
 static constexpr uint32_t PERCENT_CURRENT_ATTR_ID = 0x0003;
-// 0 = Off/Low/Medium/High. Every sequence includes Off (Apple Home uses it
-// as the power button), so Off can't be hidden; it is mapped to low instead.
+// 0 = Off/Low/Medium/High. Every sequence includes Off, so it can't be
+// hidden; FanMode writes are ignored anyway (see app_attribute_update_cb).
 static constexpr uint8_t FAN_MODE_SEQUENCE = 0;
 
 // TemperatureMeasurement cluster (I2C 2401 temperature fields)
@@ -126,21 +127,6 @@ static constexpr gpio_num_t FAIL_SAFE_PIN = GPIO_NUM_32;
 static constexpr gpio_num_t STATUS_LED_PIN = GPIO_NUM_16;
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 50;
 static constexpr uint32_t BUTTON_PRESS_THRESHOLD_MS = 100;  // min press duration to trigger
-
-// Map Matter FanMode to IthoCommand
-static IthoCommand fan_mode_to_itho(uint8_t fan_mode)
-{
-    switch (fan_mode)
-    {
-    case 0: return IthoLow;    // Off — the HRU300 cannot be turned off, map to Low
-    case 1: return IthoLow;    // Low
-    case 2: return IthoMedium; // Medium
-    case 3: return IthoHigh;   // High
-    case 4: return IthoHigh;   // On → High
-    case 6: return IthoHigh;   // Smart → High (spec, when Auto is unsupported)
-    default: return IthoUnknown; // includes Auto: the HRU300 has none
-    }
-}
 
 // Map Matter PercentSetting to an IthoCommand. The HRU300 has three speeds,
 // so the 0-100 range is split into bands.
@@ -237,15 +223,9 @@ static bool accept_reported_mode(uint8_t reported)
     return false;
 }
 
-// Apple Home maps its air purifier "Manual" state to FanMode High (3). It
-// writes that ~170 ms after a scene's PercentSetting (so a 66% scene would end
-// at High) and right after a rejected Auto write (so tapping Auto would jump to
-// High). A FanMode write this soon after either one must not change the speed.
-// Guarded by the CHIP stack lock (only touched from Matter callbacks).
-static constexpr uint32_t SPEED_HOLD_MS = 2000;
-static uint32_t speed_hold_ms = 0;
-static uint8_t speed_hold_mode = FAN_MODE_NONE;
-static bool restore_fan_mode = false;
+// FanMode written back after an ignored controller FanMode write, or
+// FAN_MODE_NONE. Guarded by the CHIP stack lock (Matter callbacks only).
+static uint8_t restore_fan_mode = FAN_MODE_NONE;
 
 // Command awaiting transmission by rf_send_task. -1 means nothing pending.
 // Command and timestamp change together under rf_cmd_mux: with separate
@@ -1135,73 +1115,42 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 
     if (type == PRE_UPDATE && attribute_id == FAN_MODE_ATTR_ID)
     {
+        // FanMode never changes the speed; only PercentSetting does. Apple
+        // Home (which shows this endpoint as an air purifier) uses FanMode to
+        // carry its own states: Manual is written as High (3) after every
+        // scene and after a rejected Auto, and Off can precede a scene's
+        // PercentSetting, so acting on them would override the speed set.
         uint8_t fan_mode = val->val.u8;
-        IthoCommand cmd = fan_mode_to_itho(fan_mode);
 
-        ESP_LOGI(TAG, "FanMode write: %d → IthoCommand %d", fan_mode, (int)cmd);
-
-        if (cmd != IthoUnknown)
+        if (fan_mode == 5)
         {
-            // The speed the unit will settle on (Off runs at low, On and
-            // Smart at high)
-            uint8_t target = (fan_mode == 0) ? 1 : (fan_mode == 4 || fan_mode == 6) ? 3 : fan_mode;
-
-            if (speed_hold_mode != FAN_MODE_NONE && target != speed_hold_mode &&
-                millis() - speed_hold_ms < SPEED_HOLD_MS)
-            {
-                // Accept the write (a failure would mark the scene as failed)
-                // but put FanMode back once it is stored, in POST_UPDATE.
-                ESP_LOGI(TAG, "FanMode write %d ignored: keeping FanMode %d from the previous write",
-                         fan_mode, speed_hold_mode);
-                restore_fan_mode = true;
-                return ESP_OK;
-            }
-
-            restore_fan_mode = false;
-            queue_rf_command(cmd);
-            note_commanded_mode(target);
-
-            // Mirror the percent attributes (writing different attributes than
-            // the in-flight FanMode write, so no overwrite conflict).
-            uint8_t percent = fan_mode_to_percent(fan_mode);
-            feedback_update_in_progress = true;
-            esp_matter_attr_val_t setting_val = esp_matter_nullable_uint8(percent);
-            esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, PERCENT_SETTING_ATTR_ID, &setting_val);
-            esp_matter_attr_val_t percent_val = esp_matter_uint8(percent);
-            esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, PERCENT_CURRENT_ATTR_ID, &percent_val);
-            feedback_update_in_progress = false;
-        }
-        else
-        {
-            // Reject (the controller sees a write failure) rather than store
-            // a mode the unit can't run, e.g. Auto
-            ESP_LOGW(TAG, "Unsupported fan mode %d rejected", fan_mode);
-            esp_matter_attr_val_t current;
-            if (esp_matter::attribute::get_val(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &current) == ESP_OK &&
-                current.val.u8 >= 1 && current.val.u8 <= 3)
-            {
-                speed_hold_mode = current.val.u8;
-                speed_hold_ms = millis();
-            }
+            // Rejecting Auto makes Apple Home fall back to Manual
+            ESP_LOGW(TAG, "FanMode write: Auto rejected (unsupported)");
             return ESP_ERR_NOT_SUPPORTED;
         }
+
+        // Accept the write (a failure would mark a scene as failed), then put
+        // the current FanMode back once it is stored, in POST_UPDATE. That runs
+        // before the fan-control server's own change handler, which then sees
+        // the restored mode instead of e.g. Off and leaves PercentSetting alone.
+        esp_matter_attr_val_t current;
+        if (esp_matter::attribute::get_val(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &current) == ESP_OK)
+        {
+            restore_fan_mode = current.val.u8;
+        }
+        ESP_LOGI(TAG, "FanMode write %d ignored (speed follows PercentSetting), keeping FanMode %d",
+                 fan_mode, restore_fan_mode);
     }
-    else if (type == POST_UPDATE && attribute_id == FAN_MODE_ATTR_ID && restore_fan_mode &&
-             millis() - speed_hold_ms < SPEED_HOLD_MS)
+    else if (type == POST_UPDATE && attribute_id == FAN_MODE_ATTR_ID && restore_fan_mode != FAN_MODE_NONE)
     {
-        // chip's fan-control server stores On (4) as a nested High write and
-        // drops the original, so the flag is time-limited in case no
-        // POST_UPDATE follows the write that raised it.
-        restore_fan_mode = false;
+        esp_matter_attr_val_t mode_val = esp_matter_enum8(restore_fan_mode);
+        restore_fan_mode = FAN_MODE_NONE;
         feedback_update_in_progress = true;
-        esp_matter_attr_val_t mode_val = esp_matter_enum8(speed_hold_mode);
         esp_matter::attribute::update(fan_endpoint_id, FAN_CONTROL_CLUSTER_ID, FAN_MODE_ATTR_ID, &mode_val);
         feedback_update_in_progress = false;
     }
     else if (type == POST_UPDATE && attribute_id == PERCENT_SETTING_ATTR_ID)
     {
-        // Apple Home sets the speed only through PercentSetting; its FanMode
-        // writes carry the Manual/Auto state.
         // The attribute is nullable and spec-limited to 0-100, so anything above
         // 100 is either the 0xFF null marker or invalid — nothing to act on.
         if (val->val.u8 > 100)
@@ -1219,8 +1168,6 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 
         queue_rf_command(cmd);
         note_commanded_mode(mode);
-        speed_hold_mode = mode;
-        speed_hold_ms = millis();
 
         // Snap PercentSetting to the nearest detent and mirror FanMode and
         // PercentCurrent, so every controller shows the same speed. This runs
