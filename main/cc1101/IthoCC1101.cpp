@@ -273,8 +273,7 @@ void IthoCC1101::initReceive()
   writeCommand(CC1101_SCAL);
 
   // wait for calibration to finish
-  while ((readRegisterWithSyncProblem(CC1101_MARCSTATE, CC1101_STATUS_REGISTER)) != CC1101_MARCSTATE_IDLE)
-    yield();
+  waitMarcState(CC1101_MARCSTATE_IDLE, "first calibration");
 
   writeRegister(CC1101_FSCAL2, 0x00);
   writeRegister(CC1101_MCSM0, 0x18); // no auto calibrate
@@ -316,8 +315,7 @@ void IthoCC1101::initReceive()
   writeCommand(CC1101_SCAL);
 
   // wait for calibration to finish
-  while ((readRegisterWithSyncProblem(CC1101_MARCSTATE, CC1101_STATUS_REGISTER)) != CC1101_MARCSTATE_IDLE)
-    yield();
+  waitMarcState(CC1101_MARCSTATE_IDLE, "second calibration");
 
   writeRegister(CC1101_MCSM0, 0x18); // no auto calibrate
 
@@ -329,8 +327,7 @@ void IthoCC1101::initReceive()
 
   writeCommand(CC1101_SRX);
 
-  while ((readRegisterWithSyncProblem(CC1101_MARCSTATE, CC1101_STATUS_REGISTER)) != CC1101_MARCSTATE_RX)
-    yield();
+  waitMarcState(CC1101_MARCSTATE_RX, "RX after init");
 
   initReceiveMessage();
 }
@@ -359,10 +356,16 @@ void IthoCC1101::initReceiveMessage()
   writeCommand(CC1101_SRX); // switch to RX state
 
   // Check that the RX state has been entered
-  while (((marcState = readRegisterWithSyncProblem(CC1101_MARCSTATE, CC1101_STATUS_REGISTER)) & CC1101_BITS_MARCSTATE) != CC1101_MARCSTATE_RX)
+  uint32_t start = millis();
+  while ((marcState = readMarcState()) != CC1101_MARCSTATE_RX)
   {
     if (marcState == CC1101_MARCSTATE_RXFIFO_OVERFLOW) // RX_OVERFLOW
       writeCommand(CC1101_SFRX);                       // flush RX buffer
+    if (millis() - start > WAIT_TIMEOUT_MS)
+    {
+      markFault("RX not entered", marcState);
+      return;
+    }
   }
 }
 

@@ -27,6 +27,7 @@
 #include <atomic>
 #include <esp_err.h>
 #include <esp_log.h>
+#include <esp_system.h>
 #include <nvs_flash.h>
 #include <driver/i2c.h>
 #include <freertos/semphr.h>
@@ -248,6 +249,55 @@ static void queue_rf_command(IthoCommand cmd)
     pending_rf_cmd = (int32_t)cmd;
     pending_rf_cmd_ms = now;
     taskEXIT_CRITICAL(&rf_cmd_mux);
+}
+
+// After ~83 h of uptime both RF tasks once hung for good: commands were queued
+// but never sent and nothing was received, while Matter and I2C kept working.
+// Radio waits are now bounded (driver fault flag), the radio lock is taken
+// with a timeout, and i2c_poll_task restarts the device (pairing is kept in
+// NVS) when a command stays unsent for RF_STALL_RESTART_MS.
+static constexpr uint32_t RF_MUTEX_TIMEOUT_MS = 5000;
+static constexpr uint32_t RF_STALL_RESTART_MS = 30000;
+static constexpr uint32_t RF_MAX_FAILED_SENDS = 3;
+
+// millis() | 1 when rf_send_task started a transmission, 0 when idle
+static std::atomic<uint32_t> rf_send_started_ms{0};
+
+static bool rf_lock(const char *who)
+{
+    if (xSemaphoreTake(rf_mutex, pdMS_TO_TICKS(RF_MUTEX_TIMEOUT_MS)) == pdTRUE)
+        return true;
+    ESP_LOGE(TAG, "HIER RF lock not available after %lu ms (%s)", (unsigned long)RF_MUTEX_TIMEOUT_MS, who);
+    return false;
+}
+
+// Reset and reconfigure the radio after a driver wait timed out (registered
+// remotes live in the driver object and survive). Caller holds rf_mutex.
+static void rf_reinit(const char *where)
+{
+    ESP_LOGW(TAG, "HIER CC1101 fault during %s, reinitialising the radio", where);
+    itho.init();
+    bool ok = !itho.takeFault();
+    ESP_LOGW(TAG, "HIER CC1101 reinit %s (chip version %d)", ok ? "OK" : "failed", itho.getChipVersion());
+}
+
+// Restart the device if a command has been waiting or transmitting far
+// longer than any send takes. Called periodically from i2c_poll_task.
+static void rf_stall_check()
+{
+    uint32_t now = millis();
+    taskENTER_CRITICAL(&rf_cmd_mux);
+    bool waiting = pending_rf_cmd >= 0 && now - pending_rf_cmd_ms > RF_STALL_RESTART_MS;
+    taskEXIT_CRITICAL(&rf_cmd_mux);
+    uint32_t started = rf_send_started_ms.load();
+    bool sending = started != 0 && now - started > RF_STALL_RESTART_MS;
+    if (!waiting && !sending)
+        return;
+    ESP_LOGE(TAG, "HIER RF stalled (%s for over %lu s), restarting",
+             waiting ? "command not picked up" : "transmission not finished",
+             (unsigned long)(RF_STALL_RESTART_MS / 1000));
+    vTaskDelay(pdMS_TO_TICKS(200)); // let the log line reach the UART
+    esp_restart();
 }
 
 // Map FanInfo (from 31DA response) to Matter FanMode. Auto states (0x18,
@@ -893,8 +943,18 @@ static void cc1101_task(void *arg)
         {
             rf_rx_pending = false;
 
-            xSemaphoreTake(rf_mutex, portMAX_DELAY);
+            if (!rf_lock("cc1101_rx"))
+            {
+                rf_rx_pending = true; // drain the FIFO on the next round
+                continue;
+            }
             itho.receivePacket();
+            if (itho.takeFault())
+            {
+                rf_reinit("receive");
+                xSemaphoreGive(rf_mutex);
+                continue;
+            }
             itho.decodeBufferedPacket();
             IthoPacket *packet = itho.checkForNewPacket();
             if (itho.parseMessage(packet))
@@ -991,6 +1051,8 @@ static void i2c_poll_task(void *arg)
             }
         }
 
+        rf_stall_check();
+
         vTaskDelay(pdMS_TO_TICKS(I2C_POLL_INTERVAL_MS));
     }
 }
@@ -999,6 +1061,7 @@ static void i2c_poll_task(void *arg)
 // the writes have settled, keeping transmissions off the CHIP stack lock.
 static void rf_send_task(void *arg)
 {
+    uint32_t failed_sends = 0;
     while (true)
     {
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -1006,21 +1069,60 @@ static void rf_send_task(void *arg)
         // Claim the command once the writes have been quiet for the debounce
         uint32_t now = millis();
         int32_t cmd = -1;
+        uint32_t queued_ms = 0;
         taskENTER_CRITICAL(&rf_cmd_mux);
         if (pending_rf_cmd >= 0 && now - pending_rf_cmd_ms >= RF_SEND_DEBOUNCE_MS)
         {
             cmd = pending_rf_cmd;
+            queued_ms = pending_rf_cmd_ms;
             pending_rf_cmd = -1;
         }
         taskEXIT_CRITICAL(&rf_cmd_mux);
         if (cmd < 0)
             continue;
 
-        xSemaphoreTake(rf_mutex, portMAX_DELAY);
-        itho.sendRFCommand(0, (IthoCommand)cmd);
+        if (!rf_lock("rf_send"))
+        {
+            // Put it back unless a newer command arrived; keeping the old
+            // timestamp lets rf_stall_check() see how long it has waited
+            taskENTER_CRITICAL(&rf_cmd_mux);
+            if (pending_rf_cmd < 0)
+            {
+                pending_rf_cmd = cmd;
+                pending_rf_cmd_ms = queued_ms;
+            }
+            taskEXIT_CRITICAL(&rf_cmd_mux);
+            continue;
+        }
+
+        // A fault can hit before or after the packet went out, so resend once
+        // after reinitialising; a repeated speed command is harmless
+        rf_send_started_ms.store(millis() | 1);
+        bool sent = false;
+        for (int attempt = 0; attempt < 2 && !sent; attempt++)
+        {
+            if (attempt > 0)
+                rf_reinit("send");
+            itho.sendRFCommand(0, (IthoCommand)cmd);
+            sent = !itho.takeFault();
+        }
+        rf_send_started_ms.store(0);
         xSemaphoreGive(rf_mutex);
 
-        ESP_LOGI(TAG, "RF command sent: remote=0, command=%d", (int)cmd);
+        if (sent)
+        {
+            failed_sends = 0;
+            ESP_LOGI(TAG, "RF command sent: remote=0, command=%d", (int)cmd);
+            continue;
+        }
+        failed_sends++;
+        ESP_LOGE(TAG, "HIER RF command %d failed: radio fault (%lu in a row)", (int)cmd, (unsigned long)failed_sends);
+        if (failed_sends >= RF_MAX_FAILED_SENDS)
+        {
+            ESP_LOGE(TAG, "HIER radio keeps failing, restarting");
+            vTaskDelay(pdMS_TO_TICKS(200)); // let the log line reach the UART
+            esp_restart();
+        }
     }
 }
 
@@ -1067,10 +1169,18 @@ static void button_task(void *arg)
                 }
 
                 // Send join command via CC1101 RF
-                xSemaphoreTake(rf_mutex, portMAX_DELAY);
-                itho.sendRFCommand(0, IthoJoin);
-                xSemaphoreGive(rf_mutex);
-                ESP_LOGI(TAG, "IthoJoin RF command sent (remote 0)");
+                if (rf_lock("btn_join"))
+                {
+                    itho.sendRFCommand(0, IthoJoin);
+                    bool faulted = itho.takeFault();
+                    if (faulted)
+                        rf_reinit("join");
+                    xSemaphoreGive(rf_mutex);
+                    if (faulted)
+                        ESP_LOGE(TAG, "HIER IthoJoin failed: radio fault, press the button again");
+                    else
+                        ESP_LOGI(TAG, "IthoJoin RF command sent (remote 0)");
+                }
 
                 // Turn LED on briefly to indicate join sequence complete
                 digitalWrite(STATUS_LED_PIN, HIGH);
@@ -1250,6 +1360,8 @@ extern "C" void app_main()
 
     // Initialize CC1101 RF module
     itho.init();
+    if (itho.takeFault())
+        ESP_LOGE(TAG, "HIER CC1101 did not reach RX at startup; RF will retry on first use");
     itho.setSendTries(3);
     itho.setRF31DACallback(rf31da_callback);
 

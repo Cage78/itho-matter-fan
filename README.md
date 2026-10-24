@@ -221,6 +221,7 @@ itho-matter-fan/
 - **sdkconfig.defaults changes require deleting `sdkconfig`**: defaults only apply on a fresh configure. If you edit `sdkconfig.defaults`, remove the `sdkconfig` file before rebuilding.
 - **Arduino `-DESP32` conflict**: Arduino-ESP32 defines `-DESP32` as a preprocessor macro, which conflicts with the Matter SDK's use of `ESP32` in include paths. Fixed by removing `-DESP32` from the Arduino component's CMakeLists.txt (v1.0 branch; no longer needed on 3.3.x).
 - **INADDR_NONE conflict**: Arduino's `IPAddress.h` declares `INADDR_NONE` as a variable, while lwIP defines it as a macro. Fixed by including Arduino.h before Matter headers in app_main.cpp.
+- **RF hang after days of uptime**: once, after ~83 h, both RF tasks stopped (commands were accepted in Apple Home but never transmitted, nothing was received) while Matter and I2C kept working. The CC1101 driver's state waits now time out and the radio is reinitialised; a command that stays unsent for 30 s, or three failed sends in a row, restart the device (the pairing is kept). Look for `HIER CC1101` / `HIER RF` lines in the serial log if it happens again.
 
 ## License
 

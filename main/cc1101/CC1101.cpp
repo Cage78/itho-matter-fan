@@ -3,6 +3,9 @@
 */
 
 #include "CC1101.h"
+#include <esp_log.h>
+
+static const char *TAG = "cc1101";
 
 // default constructor
 CC1101::CC1101()
@@ -132,13 +135,43 @@ uint8_t /* ICACHE_RAM_ATTR */ CC1101::readRegisterWithSyncProblem(uint8_t addres
     return value1;
 
   // if two consecutive reads gives us the same result then we know we are ok
-  do
+  for (int tries = 0; tries < 100; tries++)
   {
     value2 = value1;
     value1 = readRegister(address | registerType);
-  } while (value1 != value2);
+    if (value1 == value2)
+      return value1;
+  }
 
+  // A floating or glitching SPI bus never settles
+  markFault("register read never stable", value1);
   return value1;
+}
+
+void CC1101::markFault(const char *what, uint8_t marcState)
+{
+  fault = true;
+  ESP_LOGE(TAG, "HIER CC1101 timeout: %s (MARCSTATE 0x%02X)", what, marcState);
+}
+
+uint8_t CC1101::readMarcState()
+{
+  return readRegisterWithSyncProblem(CC1101_MARCSTATE, CC1101_STATUS_REGISTER) & CC1101_BITS_MARCSTATE;
+}
+
+bool CC1101::waitMarcState(uint8_t state, const char *what)
+{
+  uint32_t start = millis();
+  uint8_t marcState;
+  while ((marcState = readMarcState()) != state)
+  {
+    if (millis() - start > WAIT_TIMEOUT_MS)
+    {
+      markFault(what, marcState);
+      return false;
+    }
+  }
+  return true;
 }
 
 // registerType = CC1101_CONFIG_REGISTER or CC1101_STATUS_REGISTER
@@ -281,11 +314,19 @@ void CC1101::sendData(CC1101Packet *packet)
   {
     index += length;
     // loop until all bytes are transmitted
+    uint32_t start = millis();
     while (index < packet->length)
     {
       // check if there is free space in the fifo
       while ((txStatus = (readRegisterMedian3(CC1101_TXBYTES | CC1101_STATUS_REGISTER) & CC1101_BITS_RX_BYTES_IN_FIFO)) > (CC1101_DATA_LEN - 2))
-        ;
+      {
+        if (millis() - start > TX_TIMEOUT_MS)
+        {
+          markFault("TX FIFO never drained", readMarcState());
+          writeCommand(CC1101_SIDLE);
+          return;
+        }
+      }
 
       // calculate how many bytes we can send
       length = (CC1101_DATA_LEN - txStatus);
@@ -299,9 +340,14 @@ void CC1101::sendData(CC1101Packet *packet)
     }
   }
   // wait until transmission is finished (TXOFF_MODE is expected to be set to 0/IDLE or TXFIFO_UNDERFLOW)
-  do
+  uint32_t txStart = millis();
+  while ((MarcState = readMarcState()) != CC1101_MARCSTATE_IDLE && MarcState != CC1101_MARCSTATE_TXFIFO_UNDERFLOW)
   {
-    MarcState = (readRegisterWithSyncProblem(CC1101_MARCSTATE, CC1101_STATUS_REGISTER) & CC1101_BITS_MARCSTATE);
-    //		if (MarcState == CC1101_MARCSTATE_TXFIFO_UNDERFLOW) Serial.print("TXFIFO_UNDERFLOW occured in sendData() \n");
-  } while ((MarcState != CC1101_MARCSTATE_IDLE) && (MarcState != CC1101_MARCSTATE_TXFIFO_UNDERFLOW));
+    if (millis() - txStart > TX_TIMEOUT_MS)
+    {
+      markFault("TX never finished", MarcState);
+      writeCommand(CC1101_SIDLE);
+      return;
+    }
+  }
 }

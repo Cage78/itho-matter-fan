@@ -136,6 +136,7 @@ public:
     CC1101::init(); // init,reset CC1101
     initReceive();
   }
+  using CC1101::takeFault;
 
   void setSendTries(uint8_t number)
   {

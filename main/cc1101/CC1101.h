@@ -186,6 +186,14 @@ public:
 	void sendData(CC1101Packet *packet);
 	size_t readData(CC1101Packet *packet, size_t len);
 
+	// True if a radio state wait timed out since the last call; clears the flag.
+	bool takeFault()
+	{
+		bool f = fault;
+		fault = false;
+		return f;
+	}
+
 private:
 	CC1101(const CC1101 &c);
 	CC1101 &operator=(const CC1101 &c);
@@ -199,5 +207,14 @@ protected:
 	uint8_t readRegisterWithSyncProblem(uint8_t address, uint8_t registerType);
 
 	void reset();
+
+	// Waits on the radio are bounded: a CC1101 that stops following strobes
+	// otherwise hangs the calling task forever while it holds the radio lock.
+	static constexpr uint32_t WAIT_TIMEOUT_MS = 50;
+	static constexpr uint32_t TX_TIMEOUT_MS = 200;
+	bool fault = false;
+	void markFault(const char *what, uint8_t marcState);
+	uint8_t readMarcState();
+	bool waitMarcState(uint8_t state, const char *what);
 
 }; // CC1101
